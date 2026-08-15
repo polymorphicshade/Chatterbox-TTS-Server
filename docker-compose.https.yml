@@ -1,0 +1,93 @@
+# Same stack as docker-compose.yml, with an nginx sidecar terminating HTTPS.
+#
+#   docker compose -f docker-compose.https.yml up -d
+#   https://localhost:8443
+#
+# The certificate is self-signed and generated into ./certs on first boot, so
+# the browser will warn once until you accept it (or drop a real
+# fullchain.pem / privkey.pem into ./certs).
+services:
+  chatterbox-tts-server:
+    build:
+      args:
+      # Can be nvidia or cpu; Default is Nvidia
+        - RUNTIME=nvidia
+      context: .
+      dockerfile: Dockerfile
+    # Bound to loopback only - nginx is the way in from anywhere else. Drop the
+    # 127.0.0.1 prefix if you want plain HTTP on the LAN as well.
+    ports:
+      - "127.0.0.1:${PORT:-8004}:8004"
+    volumes:
+      # Mount local config file for persistence
+      - ./config.yaml:/app/config.yaml
+      # Mount local directories for persistent app data
+      - ./voices:/app/voices
+      - ./reference_audio:/app/reference_audio
+      - ./outputs:/app/outputs
+      - ./logs:/app/logs
+      # Named volume for Hugging Face model cache to persist across container rebuilds
+      - hf_cache:/app/hf_cache
+
+    # --- GPU Support (NVIDIA) ---
+    # The 'deploy' key is the modern way to request GPU resources.
+    # If you get a 'CDI device injection failed' error, comment out the 'deploy' section
+    # and uncomment the 'runtime: nvidia' line below.
+
+    # Method 1: Modern Docker Compose (Recommended)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    # Method 2: Legacy Docker Compose (for older setups)
+    # runtime: nvidia
+
+    restart: unless-stopped
+    environment:
+      - HF_TOKEN=YOUR_TOKEN_HERE
+      # Enable faster Hugging Face downloads inside the container
+      - HF_HUB_ENABLE_HF_TRANSFER=1
+      # Make NVIDIA GPUs visible and specify capabilities for PyTorch
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+  # TLS front end. Terminates HTTPS and proxies to the server over the internal
+  # compose network, so the app itself never speaks TLS.
+  nginx:
+    build:
+      context: ./docker/nginx
+    image: chatterbox-tts-server-nginx:local
+    restart: unless-stopped
+
+    # Start order only, not readiness: nginx returning 502 for the first minute
+    # while the model loads is better than nginx refusing to start.
+    depends_on:
+      - chatterbox-tts-server
+
+    ports:
+      - "${HTTPS_PORT:-8443}:443"
+
+    volumes:
+      - ${NGINX_CONF:-./docker/nginx/nginx.conf}:/etc/nginx/conf.d/default.conf:ro
+      # Self-signed cert is generated here on first boot. Drop real fullchain.pem
+      # / privkey.pem in to use a CA-issued one instead.
+      - ./certs:/etc/nginx/certs
+
+    environment:
+      TLS_COMMON_NAME: "${TLS_COMMON_NAME:-localhost}"
+      TLS_SAN: "${TLS_SAN:-DNS:localhost,IP:127.0.0.1}"
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsSk https://127.0.0.1/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+# Define the named volume for the Hugging Face cache
+volumes:
+  hf_cache:
