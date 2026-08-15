@@ -4,6 +4,7 @@
 # file system operations, and performance monitoring.
 
 import os
+import hashlib
 import importlib.util
 import logging
 import re
@@ -1327,6 +1328,90 @@ def trim_audio_file(
         f"{time.time() - start_time:.3f} seconds."
     )
     return True, f"Trimmed to the first {duration_sec:.1f}s.", duration_sec
+
+
+# Trimmed copies live in a dot-directory beside the references themselves.
+# get_valid_reference_files() lists files only, and skips dotted names, so these
+# never show up in the UI's reference dropdown.
+TRIMMED_CACHE_DIRNAME = ".trimmed"
+
+
+def get_trimmed_reference(
+    source_path: Path, max_duration_sec: float
+) -> Optional[Path]:
+    """
+    Returns a reference audio path guaranteed not to exceed max_duration_sec.
+
+    Files that already fit are returned unchanged. Longer ones are trimmed into a
+    cache directory and reused on later requests: a stable path matters because
+    the engine caches voice conditionals by path, and a fresh temp file per
+    request would miss that cache every time. The original file is never modified.
+
+    The cache key covers the source's name, mtime, size and the limit, so
+    replacing a reference file transparently produces a new trimmed copy.
+
+    Args:
+        source_path: The reference audio file the request asked for.
+        max_duration_sec: Maximum allowed duration in seconds.
+
+    Returns:
+        A path to audio within the limit, or None if trimming was needed but
+        failed.
+    """
+    duration = get_audio_duration(source_path)
+    if duration is None:
+        # Unknown length: pass it through rather than block generation.
+        logger.warning(
+            f"Could not determine duration of '{source_path.name}'; using it as-is."
+        )
+        return source_path
+    if duration <= max_duration_sec:
+        return source_path
+
+    try:
+        stat = source_path.stat()
+        fingerprint = hashlib.md5(
+            f"{source_path.name}|{stat.st_mtime_ns}|{stat.st_size}|{max_duration_sec}".encode()
+        ).hexdigest()[:12]
+        cache_dir = source_path.parent / TRIMMED_CACHE_DIRNAME
+        cached_path = cache_dir / f"{source_path.stem}_{fingerprint}.wav"
+
+        if cached_path.is_file() and cached_path.stat().st_size > 0:
+            logger.debug(f"Using cached trimmed reference: {cached_path.name}")
+            return cached_path
+
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        success, message, trimmed_duration = trim_audio_file(
+            source_path, cached_path, max_duration_sec
+        )
+        if not success:
+            logger.error(f"Could not trim '{source_path.name}': {message}")
+            return None
+
+        logger.info(
+            f"Reference '{source_path.name}' is {duration:.2f}s, over the "
+            f"{max_duration_sec}s limit; using the first {trimmed_duration:.2f}s."
+        )
+
+        # Drop trimmed copies of this same source made from older versions of the
+        # file. The pattern is anchored on the 12-hex fingerprint so a reference
+        # whose name merely starts with this one's stem is never touched.
+        stale_pattern = re.compile(
+            rf"^{re.escape(source_path.stem)}_[0-9a-f]{{12}}\.wav$"
+        )
+        for existing in cache_dir.iterdir():
+            if existing != cached_path and stale_pattern.match(existing.name):
+                existing.unlink(missing_ok=True)
+                logger.debug(f"Removed stale trimmed reference: {existing.name}")
+
+        return cached_path
+
+    except Exception as e:
+        logger.error(
+            f"Error preparing trimmed reference for '{source_path.name}': {e}",
+            exc_info=True,
+        )
+        return None
 
 
 # --- Reference Audio Denoising ---

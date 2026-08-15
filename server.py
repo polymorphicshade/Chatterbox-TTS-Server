@@ -1141,13 +1141,27 @@ async def custom_tts_endpoint(
                 status_code=404,
                 detail=f"Reference audio file '{request.reference_audio_filename}' not found.",
             )
-        max_dur = config_manager.get_int("audio_output.max_reference_duration_sec", 30)
-        is_valid, msg = utils.validate_reference_audio(potential_path, max_dur)
+        # Format only: an over-long reference is trimmed below, not rejected.
+        is_valid, msg = utils.validate_reference_audio(potential_path)
         if not is_valid:
             raise HTTPException(
                 status_code=400, detail=f"Invalid reference audio: {msg}"
             )
-        audio_prompt_path_for_engine = potential_path
+
+        # Covers references that predate upload-time trimming, or that were copied
+        # into the directory by hand. The trimmed copy is cached beside them, so
+        # this costs nothing after the first request for a given file.
+        max_dur = config_manager.get_int("audio_output.max_reference_duration_sec", 30)
+        trimmed_path = utils.get_trimmed_reference(potential_path, max_dur)
+        if trimmed_path is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Reference audio '{request.reference_audio_filename}' is longer than "
+                    f"the {max_dur}s maximum and could not be trimmed."
+                ),
+            )
+        audio_prompt_path_for_engine = trimmed_path
         logger.info(
             f"Using reference audio for cloning: {request.reference_audio_filename}"
         )
@@ -1617,6 +1631,19 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
         raise HTTPException(
             status_code=404, detail=f"Voice file '{request.voice}' not found."
         )
+
+    # The model's reference limit applies whichever directory the voice came from.
+    max_dur = config_manager.get_int("audio_output.max_reference_duration_sec", 30)
+    trimmed_prompt_path = utils.get_trimmed_reference(audio_prompt_path, max_dur)
+    if trimmed_prompt_path is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Voice file '{request.voice}' is longer than the {max_dur}s maximum "
+                f"and could not be trimmed."
+            ),
+        )
+    audio_prompt_path = trimmed_prompt_path
 
     # Check if the TTS model is loaded
     if not engine.MODEL_LOADED:
