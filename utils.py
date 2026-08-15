@@ -1259,6 +1259,76 @@ def validate_reference_audio(
     return True, "Reference audio appears valid."
 
 
+def trim_audio_file(
+    source_path: Path, destination_path: Path, max_duration_sec: float
+) -> Tuple[bool, str, float]:
+    """
+    Writes the first max_duration_sec of an audio file to a 16-bit WAV.
+
+    Only the frames that are kept are read from disk, so trimming a very long
+    recording down to a reference clip costs no more memory than the clip itself.
+
+    Args:
+        source_path: Audio file to trim.
+        destination_path: Where to write the trimmed WAV. May equal source_path;
+            the audio is read and the handle closed before anything is written.
+        max_duration_sec: How much audio to keep, from the start.
+
+    Returns:
+        A tuple (success: bool, message: str, duration_sec: float). On failure
+        duration_sec is 0.0 and the destination is left untouched.
+    """
+    if max_duration_sec <= 0:
+        return False, "Trim length must be greater than zero.", 0.0
+
+    start_time = time.time()
+    audio = None
+    sample_rate = 0
+
+    try:
+        # Frame-limited read: never pulls the whole file into memory.
+        with sf.SoundFile(str(source_path)) as f:
+            sample_rate = f.samplerate
+            audio = f.read(int(max_duration_sec * sample_rate), dtype="float32")
+    except Exception as e_sf:
+        logger.debug(
+            f"soundfile could not trim '{source_path.name}': {e_sf}. Trying pydub."
+        )
+        try:
+            # ffmpeg-backed fallback for formats libsndfile cannot open. This one
+            # does decode the whole file before slicing.
+            segment = AudioSegment.from_file(str(source_path))[
+                : int(max_duration_sec * 1000)
+            ]
+            segment = segment.set_sample_width(2)
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
+            segment.export(str(destination_path), format="wav")
+            duration_sec = len(segment) / 1000.0
+            logger.info(
+                f"Trimmed '{source_path.name}' to {duration_sec:.2f}s via pydub in "
+                f"{time.time() - start_time:.3f} seconds."
+            )
+            return True, f"Trimmed to the first {duration_sec:.1f}s.", duration_sec
+        except Exception as e_pydub:
+            logger.error(
+                f"Error trimming '{source_path.name}': {e_pydub}", exc_info=True
+            )
+            return False, f"Failed to trim audio: {e_pydub}", 0.0
+
+    if audio is None or audio.size == 0:
+        return False, f"No audio could be read from '{source_path.name}'.", 0.0
+
+    if not save_audio_to_file(audio, sample_rate, str(destination_path)):
+        return False, "Failed to write trimmed audio.", 0.0
+
+    duration_sec = len(audio) / float(sample_rate)
+    logger.info(
+        f"Trimmed '{source_path.name}' to {duration_sec:.2f}s in "
+        f"{time.time() - start_time:.3f} seconds."
+    )
+    return True, f"Trimmed to the first {duration_sec:.1f}s.", duration_sec
+
+
 # --- Reference Audio Denoising ---
 # init_df() builds the model and loads weights, which is slow and downloads on
 # first use; keep the result for the life of the process.

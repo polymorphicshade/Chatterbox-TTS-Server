@@ -676,6 +676,10 @@ async def upload_reference_audio_endpoint(
     Handles uploading of reference audio files (.wav, .mp3) for voice cloning.
     Validates files and saves them to the configured reference audio path.
 
+    Clips longer than 'audio_output.max_reference_duration_sec' are trimmed to
+    that length rather than rejected, since the model only conditions on the
+    first part of a reference anyway.
+
     Clips shorter than 'audio_output.min_reference_duration_sec' are unusable on
     their own for cloning, so when two or more of them arrive in the same upload
     they are chained into a single reference file, separated by
@@ -744,9 +748,9 @@ async def upload_reference_audio_endpoint(
                 with open(staged_path, "wb") as buffer:
                     shutil.copyfileobj(file.file, buffer)
 
-                is_valid, validation_msg = utils.validate_reference_audio(
-                    staged_path, max_duration
-                )
+                # Duration is deliberately not checked here: an over-long clip is
+                # trimmed below rather than rejected.
+                is_valid, validation_msg = utils.validate_reference_audio(staged_path)
                 if not is_valid:
                     logger.warning(
                         f"Uploaded file '{safe_filename}' failed validation: {validation_msg}. Discarding."
@@ -756,9 +760,54 @@ async def upload_reference_audio_endpoint(
                     )
                     continue
 
-                # Denoise before measuring and chaining, so each clip is cleaned
-                # against its own noise profile and the duration recorded below
-                # is the one the saved file actually has.
+                duration = utils.get_audio_duration(staged_path)
+                if duration is not None and duration <= 0:
+                    upload_errors.append(
+                        {
+                            "filename": safe_filename,
+                            "error": "File contains no audio (zero duration).",
+                        }
+                    )
+                    continue
+
+                # Trim before denoising: the model only ever sees the first
+                # max_duration seconds, so there is no point enhancing the rest.
+                if duration is not None and duration > max_duration:
+                    trimmed_path = staged_path.with_name(
+                        f"{staged_path.stem}_trimmed.wav"
+                    )
+                    ok, trim_msg, trimmed_duration = utils.trim_audio_file(
+                        staged_path, trimmed_path, max_duration
+                    )
+                    if ok:
+                        original_duration = duration
+                        staged_path = trimmed_path
+                        # Trimming always writes WAV, so an MP3 input changes
+                        # extension; keep the stored name in step with the file.
+                        safe_filename = f"{Path(safe_filename).stem}.wav"
+                        duration = trimmed_duration
+                        logger.info(
+                            f"Trimmed '{safe_filename}' from {original_duration:.2f}s "
+                            f"to {duration:.2f}s (max {max_duration}s)."
+                        )
+                        upload_warnings.append(
+                            {
+                                "filename": safe_filename,
+                                "warning": (
+                                    f"Clip was {original_duration:.1f}s, longer than the "
+                                    f"{max_duration}s maximum — the first {duration:.1f}s "
+                                    f"were kept."
+                                ),
+                            }
+                        )
+                    else:
+                        upload_errors.append(
+                            {"filename": safe_filename, "error": trim_msg}
+                        )
+                        continue
+
+                # Denoise after trimming, so each clip is cleaned against its own
+                # noise profile and only the audio being kept is processed.
                 if denoise:
                     denoised_path = staged_path.with_name(
                         f"{staged_path.stem}_denoised.wav"
@@ -797,68 +846,70 @@ async def upload_reference_audio_endpoint(
         keep_separate = [s for s in staged_files if s not in too_short]
 
         if len(too_short) >= 2:
-            gap_total_sec = (gap_ms / 1000.0) * (len(too_short) - 1)
-            projected_duration = sum(s[2] for s in too_short) + gap_total_sec
+            base_stem = Path(too_short[0][0]).stem
+            destination_path = utils.get_unique_destination(
+                ref_path, f"{base_stem}_combined.wav"
+            )
+            success, combine_msg, combined_duration = utils.concatenate_audio_files(
+                [s[1] for s in too_short], destination_path, gap_ms
+            )
 
-            if projected_duration > max_duration:
-                # Saving the pieces individually beats failing the upload outright;
-                # the user keeps their audio and can retry with fewer clips.
-                logger.warning(
-                    f"Combining {len(too_short)} clips would produce {projected_duration:.2f}s, "
-                    f"over the {max_duration}s maximum. Saving them individually instead."
-                )
-                upload_warnings.append(
-                    {
-                        "filename": ", ".join(s[0] for s in too_short),
-                        "warning": (
-                            f"Chaining these {len(too_short)} clips would produce "
-                            f"{projected_duration:.1f}s of audio (including {gap_total_sec:.1f}s of "
-                            f"inserted silence), which exceeds the {max_duration}s maximum. "
-                            f"They were saved individually — re-upload fewer clips at a time to chain them."
-                        ),
-                    }
-                )
-                keep_separate.extend(too_short)
-            else:
-                base_stem = Path(too_short[0][0]).stem
-                destination_path = utils.get_unique_destination(
-                    ref_path, f"{base_stem}_combined.wav"
-                )
-                success, combine_msg, combined_duration = utils.concatenate_audio_files(
-                    [s[1] for s in too_short], destination_path, gap_ms
+            if success:
+                combined_filename = destination_path.name
+                combined_sources = [s[0] for s in too_short]
+                uploaded_filenames_successfully.insert(0, combined_filename)
+                logger.info(
+                    f"Chained {len(too_short)} short clip(s) into '{combined_filename}': {combine_msg}"
                 )
 
-                if success:
-                    combined_filename = destination_path.name
-                    combined_sources = [s[0] for s in too_short]
-                    uploaded_filenames_successfully.insert(0, combined_filename)
-                    logger.info(
-                        f"Chained {len(too_short)} short clip(s) into '{combined_filename}': {combine_msg}"
+                # Enough short clips, each with a silence gap after it, can overrun
+                # the maximum. Trim to fit rather than rejecting the batch.
+                if combined_duration > max_duration:
+                    ok, trim_msg, trimmed_duration = utils.trim_audio_file(
+                        destination_path, destination_path, max_duration
                     )
-                    # Judge against speech content, not padded length: the inserted
-                    # silence lengthens the file without giving the model more voice
-                    # to work from, so it must not satisfy the minimum on its own.
-                    content_duration = sum(s[2] for s in too_short)
-                    if content_duration < min_duration:
+                    if ok:
                         upload_warnings.append(
                             {
                                 "filename": combined_filename,
                                 "warning": (
-                                    f"Combined reference is {combined_duration:.1f}s, but only "
-                                    f"{content_duration:.1f}s of that is speech — under the "
-                                    f"{min_duration:.0f}s recommended minimum. Cloning quality may suffer; "
-                                    f"add more clips and upload them together."
+                                    f"Chaining these {len(too_short)} clips produced "
+                                    f"{combined_duration:.1f}s, over the {max_duration}s maximum — "
+                                    f"the first {trimmed_duration:.1f}s were kept. Upload fewer "
+                                    f"clips at a time to keep all of them."
                                 ),
                             }
                         )
-                else:
-                    upload_errors.append(
+                        combined_duration = trimmed_duration
+                    else:
+                        upload_warnings.append(
+                            {"filename": combined_filename, "warning": trim_msg}
+                        )
+
+                # Judge against speech content, not padded length: the inserted
+                # silence lengthens the file without giving the model more voice
+                # to work from, so it must not satisfy the minimum on its own.
+                content_duration = sum(s[2] for s in too_short)
+                if content_duration < min_duration:
+                    upload_warnings.append(
                         {
-                            "filename": ", ".join(s[0] for s in too_short),
-                            "error": combine_msg,
+                            "filename": combined_filename,
+                            "warning": (
+                                f"Combined reference is {combined_duration:.1f}s, but only "
+                                f"{content_duration:.1f}s of that is speech — under the "
+                                f"{min_duration:.0f}s recommended minimum. Cloning quality may suffer; "
+                                f"add more clips and upload them together."
+                            ),
                         }
                     )
-                    keep_separate.extend(too_short)
+            else:
+                upload_errors.append(
+                    {
+                        "filename": ", ".join(s[0] for s in too_short),
+                        "error": combine_msg,
+                    }
+                )
+                keep_separate.extend(too_short)
         elif len(too_short) == 1:
             # Nothing to chain it with; save it, but say why it may disappoint.
             upload_warnings.append(
