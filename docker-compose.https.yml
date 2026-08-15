@@ -1,7 +1,14 @@
 # Same stack as docker-compose.yml, with an nginx sidecar terminating HTTPS.
 #
-#   docker compose -f docker-compose.https.yml up -d
+#   docker compose -f docker-compose.https.yml up -d --build
 #   https://localhost:8443
+#
+# HTTPS is port 8443, not 8004. 8004 is the app's own plain HTTP listener and
+# is published on 127.0.0.1 only; pointing a browser at https://<host>:8004
+# gets you "SSL_ERROR_RX_RECORD_TOO_LONG", because nothing there speaks TLS.
+#
+# Copy .env.https.example to .env to change ports, or to put the host's LAN
+# address in the certificate before first boot.
 #
 # The certificate is self-signed and generated into ./certs on first boot, so
 # the browser will warn once until you accept it (or drop a real
