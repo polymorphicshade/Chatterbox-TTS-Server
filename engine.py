@@ -1,12 +1,16 @@
 # File: engine.py
 # Core TTS model loading and speech generation logic.
 
+import functools
 import gc
 import logging
 import os
 import random
+import threading
 import numpy as np
 import torch
+import torch.nn.functional as F
+from contextlib import contextmanager
 from typing import Optional, Tuple
 from pathlib import Path
 
@@ -115,6 +119,138 @@ loaded_model_class_name: Optional[str] = None  # "ChatterboxTTS" or "ChatterboxT
 # Voice conditioning cache: avoids re-encoding the same voice file on every request.
 # Key: (resolved_path, file_mtime, exaggeration) — mtime invalidates if file changes.
 _conds_cache: dict = {}
+
+
+# --- Talking speed, applied in the mel domain ---
+#
+# Stretching the finished waveform is a compromise: any time-domain stretcher
+# either reconstructs phase (phase vocoder -> smeared transients that read as
+# echo) or splices overlapping slices (WSOLA -> better, but grainy past roughly
+# +/-25%).
+#
+# S3Gen generates a mel spectrogram and then vocodes it with HiFiGAN. Resampling
+# that mel along its time axis *before* the vocoder runs sidesteps the problem
+# entirely: HiFiGAN synthesises coherent phase from scratch for whatever mel it
+# is handed, so there is no phase to smear and no splice to hear. Pitch survives
+# because it is encoded in which mel bins are active, not in how many frames
+# they span - stretching time slows the F0 contour without moving it. This is
+# how the upstream CosyVoice models (which S3Gen derives from) implement their
+# own `speed` parameter.
+#
+# The cost is that the mel is now slightly out of the distribution HiFiGAN was
+# trained on, so quality degrades at extremes rather than gracefully; and
+# because the mel is stretched uniformly, every phoneme scales by the same
+# factor instead of the way a real speaker compresses vowels more than
+# consonants. In practice roughly 0.7x-1.4x is transparent.
+MEL_SPEED_SUPPORTED: bool = False
+
+# Set per-thread rather than by swapping the hook in and out, because the
+# streaming endpoint synthesises in a worker thread while the event loop may be
+# serving another request inline. A thread-local keeps those from colliding
+# without serialising generation.
+_mel_speed_state = threading.local()
+
+
+@contextmanager
+def _mel_speed(speed: float):
+    """Makes `speed` the mel time-scale factor for the calling thread only."""
+    previous = getattr(_mel_speed_state, "speed", 1.0)
+    _mel_speed_state.speed = speed
+    try:
+        yield
+    finally:
+        _mel_speed_state.speed = previous
+
+
+def _time_scale_mel(mel: torch.Tensor, speed: float) -> torch.Tensor:
+    """
+    Resamples a (batch, n_mels, frames) mel along its time axis.
+
+    A speed of 1.5 yields two thirds the frames, so the vocoder renders the same
+    utterance in two thirds the time.
+    """
+    if not isinstance(mel, torch.Tensor) or mel.dim() != 3:
+        logger.warning(
+            f"Mel speed hook: unexpected mel shape "
+            f"{tuple(mel.shape) if isinstance(mel, torch.Tensor) else type(mel)}; "
+            f"leaving it untouched."
+        )
+        return mel
+
+    target_frames = max(1, int(round(mel.shape[2] / speed)))
+    if target_frames == mel.shape[2]:
+        return mel
+
+    # Interpolate in float32: linear interpolation on bf16 mels loses precision
+    # the vocoder is sensitive to, and not every backend implements it.
+    scaled = F.interpolate(
+        mel.float(), size=target_frames, mode="linear", align_corners=False
+    )
+    return scaled.to(mel.dtype)
+
+
+def _install_mel_speed_hook(model) -> bool:
+    """
+    Wraps the loaded model's HiFiGAN vocoder so it honours the per-thread speed.
+
+    Returns True if the hook is in place. Returns False - without raising - when
+    the installed chatterbox exposes a different internal structure, in which
+    case callers fall back to waveform stretching.
+    """
+    s3gen = getattr(model, "s3gen", None)
+    mel2wav = getattr(s3gen, "mel2wav", None)
+    original = getattr(mel2wav, "inference", None)
+
+    if original is None or not callable(original):
+        logger.warning(
+            "Mel-domain speed control unavailable: could not find "
+            "model.s3gen.mel2wav.inference on the loaded model. Speed changes "
+            "will fall back to waveform time stretching."
+        )
+        return False
+
+    if getattr(original, "_mel_speed_hook", False):
+        return True  # Already wrapped (e.g. a reload that reused the object).
+
+    @functools.wraps(original)
+    def inference_with_speed(*args, **kwargs):
+        speed = getattr(_mel_speed_state, "speed", 1.0)
+        if speed == 1.0:
+            return original(*args, **kwargs)
+
+        # chatterbox calls this by keyword, but tolerate positional too. `self`
+        # is already bound, so speech_feat is the first positional argument.
+        if "speech_feat" in kwargs:
+            kwargs["speech_feat"] = _time_scale_mel(kwargs["speech_feat"], speed)
+        elif args:
+            args = (_time_scale_mel(args[0], speed),) + args[1:]
+        else:
+            logger.warning("Mel speed hook: no mel argument found; skipping.")
+            return original(*args, **kwargs)
+
+        # A cached excitation source was computed against the unstretched mel and
+        # no longer lines up with it. Upstream drops it in exactly this case;
+        # keeping it would splice misaligned periods into the output.
+        cache_source = kwargs.get("cache_source")
+        if isinstance(cache_source, torch.Tensor) and cache_source.numel() > 0:
+            kwargs["cache_source"] = cache_source.new_zeros(
+                (cache_source.shape[0], cache_source.shape[1], 0)
+            )
+
+        return original(*args, **kwargs)
+
+    inference_with_speed._mel_speed_hook = True
+    mel2wav.inference = inference_with_speed
+    logger.info(
+        "Mel-domain speed control installed on s3gen.mel2wav.inference "
+        "(artifact-free talking speed)."
+    )
+    return True
+
+
+def mel_speed_available() -> bool:
+    """True if talking speed can be applied inside the vocoder on this model."""
+    return MODEL_LOADED and MEL_SPEED_SUPPORTED
 
 
 def _conds_cache_key(path: str, exaggeration: float) -> tuple:
@@ -277,7 +413,7 @@ def load_model() -> bool:
         bool: True if the model was loaded successfully, False otherwise.
     """
     global chatterbox_model, MODEL_LOADED, model_device
-    global loaded_model_type, loaded_model_class_name
+    global loaded_model_type, loaded_model_class_name, MEL_SPEED_SUPPORTED
 
     if MODEL_LOADED:
         logger.info("TTS model is already loaded.")
@@ -382,6 +518,9 @@ def load_model() -> bool:
             loaded_model_type = model_type
             loaded_model_class_name = model_class.__name__
 
+            # Must happen after the model object exists and before any request.
+            MEL_SPEED_SUPPORTED = _install_mel_speed_hook(chatterbox_model)
+
             logger.info(f"Successfully loaded {model_class.__name__} on {model_device}")
             logger.info(f"Model sample rate: {chatterbox_model.sr} Hz")
         except ImportError as e_import:
@@ -432,6 +571,7 @@ def synthesize(
     cfg_weight: float = 0.5,
     seed: int = 0,
     language: str = "en",
+    speed_factor: float = 1.0,
 ) -> Tuple[Optional[torch.Tensor], Optional[int]]:
     """
     Synthesizes audio from text using the loaded TTS model.
@@ -445,6 +585,10 @@ def synthesize(
         seed: Random seed for generation. If 0, default randomness is used.
               If non-zero, a global seed is set for reproducibility.
         language: Language code for multilingual model (e.g., 'en', 'it', 'de').
+        speed_factor: Talking speed, applied in the mel domain before the vocoder
+              runs, so the output has no time-stretching artifacts. Silently
+              ignored unless mel_speed_available() is True - check that first and
+              fall back to utils.apply_speed_factor if it is False.
 
     Returns:
         A tuple containing the audio waveform (torch.Tensor) and the sample rate (int),
@@ -484,10 +628,24 @@ def synthesize(
                 effective_prompt = None  # conds already set, skip prepare_conditionals
                 logger.debug(f"Voice cache hit: {audio_prompt_path}")
 
+        # Talking speed rides along on a thread-local that the vocoder hook reads
+        # mid-generation; there is no way to pass it through generate() itself.
+        effective_speed = speed_factor if MEL_SPEED_SUPPORTED else 1.0
+        if speed_factor != 1.0 and not MEL_SPEED_SUPPORTED:
+            logger.debug(
+                f"Ignoring speed_factor {speed_factor} in the engine: mel-domain "
+                f"speed is unavailable on this model. The caller is expected to "
+                f"stretch the waveform instead."
+            )
+        elif effective_speed != 1.0:
+            logger.debug(f"Generating at mel-domain speed {effective_speed}.")
+
         # Call the core model's generate method.
         # autocast promotes float32 inputs to bfloat16 to match T3/S3Gen weights,
         # keeping numerically sensitive ops (softmax, norms) in float32 automatically.
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=BF16_ENABLED):
+        with _mel_speed(effective_speed), torch.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=BF16_ENABLED
+        ):
             if loaded_model_type == "multilingual":
                 wav_tensor = chatterbox_model.generate(
                     text=text,
@@ -529,6 +687,7 @@ def unload_model() -> bool:
         bool: True if the model was unloaded successfully, False otherwise.
     """
     global chatterbox_model, MODEL_LOADED, model_device, loaded_model_type, loaded_model_class_name
+    global MEL_SPEED_SUPPORTED
 
     logger.info("Initiating model unload sequence...")
 
@@ -543,6 +702,7 @@ def unload_model() -> bool:
     model_device = None
     loaded_model_type = None
     loaded_model_class_name = None
+    MEL_SPEED_SUPPORTED = False  # Re-probed against whatever loads next.
 
     # 3. Force Python Garbage Collection
     gc.collect()
@@ -577,6 +737,7 @@ def reload_model() -> bool:
         bool: True if the new model loaded successfully, False otherwise.
     """
     global chatterbox_model, MODEL_LOADED, model_device, loaded_model_type, loaded_model_class_name, _conds_cache
+    global MEL_SPEED_SUPPORTED
 
     logger.info("Initiating model hot-swap/reload sequence...")
 
@@ -590,6 +751,7 @@ def reload_model() -> bool:
     MODEL_LOADED = False
     loaded_model_type = None
     loaded_model_class_name = None
+    MEL_SPEED_SUPPORTED = False  # Re-probed against whatever loads next.
     _conds_cache.clear()
     logger.info("Voice conditioning cache cleared.")
 

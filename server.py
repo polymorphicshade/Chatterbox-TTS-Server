@@ -1360,6 +1360,12 @@ async def custom_tts_endpoint(
             if request.speed_factor is not None
             else get_gen_default_speed_factor()
         )
+        # Prefer applying speed inside the vocoder, which leaves no artifacts.
+        # Waveform stretching is only used where that hook is unavailable.
+        mel_speed_stream = (
+            speed_factor_stream if engine.mel_speed_available() else 1.0
+        )
+        wav_speed_stream = 1.0 if engine.mel_speed_available() else speed_factor_stream
         audio_prompt_str = (
             str(audio_prompt_path_for_engine) if audio_prompt_path_for_engine else None
         )
@@ -1398,6 +1404,7 @@ async def custom_tts_endpoint(
                         cfg_weight=cfg_weight_val,
                         seed=seed_val,
                         language=language_val,
+                        speed_factor=mel_speed_stream,
                     ),
                 )
 
@@ -1405,12 +1412,12 @@ async def custom_tts_endpoint(
                     logger.error(f"Streaming TTS: engine returned None for chunk {i+1}; stopping stream.")
                     return
 
-                # Streaming has no finished clip to stretch, so this stays
-                # per-chunk. Chunks are sentence-sized, which is long enough
-                # that restarting the stretcher at each boundary is inaudible.
-                if speed_factor_stream != 1.0:
+                # Fallback path only. Streaming has no finished clip to stretch,
+                # so this stays per-chunk; chunks are sentence-sized, which is
+                # long enough that restarting the stretcher is inaudible.
+                if wav_speed_stream != 1.0:
                     audio_tensor, _ = utils.apply_speed_factor(
-                        audio_tensor, chunk_sr, speed_factor_stream
+                        audio_tensor, chunk_sr, wav_speed_stream
                     )
 
                 audio_np = audio_tensor.cpu().numpy().squeeze().astype(np.float32)
@@ -1443,6 +1450,17 @@ async def custom_tts_endpoint(
             headers={"Content-Disposition": f'attachment; filename="{stream_filename}"'},
         )
     # --- End streaming fork ---
+
+    # Talking speed is applied inside the vocoder when the loaded model supports
+    # it (no artifacts, so it can run per chunk), and otherwise by stretching the
+    # finished waveform once, further below.
+    speed_factor_to_use = (
+        request.speed_factor
+        if request.speed_factor is not None
+        else get_gen_default_speed_factor()
+    )
+    use_mel_speed = engine.mel_speed_available()
+    mel_speed_to_use = speed_factor_to_use if use_mel_speed else 1.0
 
     for i, chunk in enumerate(text_chunks):
         logger.info(f"Synthesizing chunk {i+1}/{len(text_chunks)}...")
@@ -1477,6 +1495,7 @@ async def custom_tts_endpoint(
                     if request.language is not None
                     else get_gen_default_language()
                 ),
+                speed_factor=mel_speed_to_use,
             )
             perf_monitor.record(f"Engine synthesized chunk {i+1}")
 
@@ -1495,11 +1514,13 @@ async def custom_tts_endpoint(
 
             current_processed_audio_tensor = chunk_audio_tensor
 
-            # Speed is deliberately NOT applied here. Stretching every chunk
-            # separately restarts the stretcher's analysis at each boundary and
-            # leaves the stitched-in sentence pauses at their original length,
-            # so a "faster" voice still pauses at normal speed. It is applied
-            # once to the finished, stitched clip instead - see below.
+            # Waveform stretching is deliberately NOT done here. Stretching every
+            # chunk separately restarts the stretcher's analysis at each boundary
+            # and leaves the stitched-in sentence pauses at their original
+            # length, so a "faster" voice still pauses at normal speed. When the
+            # vocoder hook is unavailable it runs once on the stitched clip -
+            # see below. (Mel-domain speed has already been applied above,
+            # inside generation, where per-chunk costs nothing.)
 
             # ### MODIFICATION ###
             # All other processing is REMOVED from the loop.
@@ -1535,6 +1556,13 @@ async def custom_tts_endpoint(
         DC_HIGHPASS_HZ = 15  # High-pass cutoff for DC removal
         PEAK_NORMALIZE_THRESHOLD = 0.99  # Normalize if peak exceeds this
         PEAK_NORMALIZE_TARGET = 0.95  # Target peak after normalization
+
+        # A faster talker also pauses less. On the fallback path the whole clip
+        # is stretched afterwards, which scales these pauses for free; with
+        # mel-domain speed the chunks come back already fast and the pauses
+        # between them would otherwise stay at their original length.
+        if use_mel_speed and speed_factor_to_use != 1.0:
+            SENTENCE_PAUSE_MS = SENTENCE_PAUSE_MS / speed_factor_to_use
 
         # Read smart stitching toggle from config (defaults to True)
         enable_smart_stitching = config_manager.get_bool(
@@ -1678,16 +1706,12 @@ async def custom_tts_endpoint(
             status_code=500, detail=f"Audio stitching error: {e_concat}"
         )
 
-    # --- Talking speed (applied once, to the complete clip) ---
-    # Placed after silence trimming and the internal-silence fix, whose
-    # thresholds are tuned against natural-tempo speech, and after stitching so
-    # that sentence pauses scale with the voice instead of staying fixed.
-    speed_factor_to_use = (
-        request.speed_factor
-        if request.speed_factor is not None
-        else get_gen_default_speed_factor()
-    )
-    if speed_factor_to_use != 1.0:
+    # --- Talking speed: waveform fallback, applied once to the complete clip ---
+    # Only reached when the vocoder hook is unavailable. Placed after silence
+    # trimming and the internal-silence fix, whose thresholds are tuned against
+    # natural-tempo speech, and after stitching so that sentence pauses scale
+    # with the voice instead of staying fixed.
+    if not use_mel_speed and speed_factor_to_use != 1.0:
         final_audio_np = utils.apply_speed_factor_np(
             final_audio_np, engine_output_sample_rate, speed_factor_to_use
         )
@@ -1835,6 +1859,11 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
         all_audio_segments_np: List[np.ndarray] = []
         engine_sr: Optional[int] = None
 
+        # Same two-tier handling as /tts: inside the vocoder when possible,
+        # otherwise a single waveform stretch of the stitched clip.
+        use_mel_speed = engine.mel_speed_available()
+        mel_speed_to_use = request.speed if use_mel_speed else 1.0
+
         for i, chunk_text in enumerate(text_chunks):
             chunk_seed = seed_to_use + i if seed_to_use is not None and seed_to_use >= 0 else seed_to_use
 
@@ -1846,6 +1875,7 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
                 cfg_weight=get_gen_default_cfg_weight(),
                 seed=chunk_seed,
                 language=request.language or get_gen_default_language(),
+                speed_factor=mel_speed_to_use,
             )
 
             if audio_tensor is None or sr is None:
@@ -1857,7 +1887,7 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
             if engine_sr is None:
                 engine_sr = sr
 
-            # Speed is applied once to the stitched clip below, not per chunk.
+            # Any waveform stretch happens once on the stitched clip, not here.
             chunk_np = audio_tensor.cpu().numpy().squeeze().astype(np.float32)
             all_audio_segments_np.append(chunk_np)
 
@@ -1867,6 +1897,9 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
         else:
             CROSSFADE_MS = 20
             SENTENCE_PAUSE_MS = 200
+            # Pauses shorten with the voice; see the matching note in /tts.
+            if use_mel_speed and request.speed != 1.0:
+                SENTENCE_PAUSE_MS = SENTENCE_PAUSE_MS / request.speed
             fade_samples = int(CROSSFADE_MS / 1000 * engine_sr)
             silence_buffer_samples = int(SENTENCE_PAUSE_MS / 1000 * engine_sr) + (fade_samples * 2)
 
@@ -1881,9 +1914,9 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
                 f"OpenAI speech: stitched {len(all_audio_segments_np)} chunks with {CROSSFADE_MS}ms crossfades"
             )
 
-        # Talking speed, applied once to the stitched clip so that the sentence
-        # pauses scale with the voice and the stretcher runs a single pass.
-        if request.speed != 1.0:
+        # Waveform fallback, applied once to the stitched clip so that the
+        # sentence pauses scale with the voice and the stretcher runs one pass.
+        if not use_mel_speed and request.speed != 1.0:
             final_audio_np = utils.apply_speed_factor_np(
                 final_audio_np, engine_sr, request.speed
             )
