@@ -743,7 +743,9 @@ document.addEventListener('DOMContentLoaded', async function () {
 
         if (textArea) textArea.addEventListener('input', () => { if (charCount) charCount.textContent = textArea.value.length; debouncedSaveState(); });
         if (predefinedVoiceSelect) predefinedVoiceSelect.addEventListener('change', debouncedSaveState);
-        if (cloneReferenceSelect) cloneReferenceSelect.addEventListener('change', debouncedSaveState);
+        // Stop any sample in flight: hearing the previous file after switching
+        // reference is just confusing.
+        if (cloneReferenceSelect) cloneReferenceSelect.addEventListener('change', () => { stopReferencePreview(); debouncedSaveState(); });
         if (seedInput) seedInput.addEventListener('change', debouncedSaveState);
         if (splitTextToggle) splitTextToggle.addEventListener('change', () => { toggleChunkControlsVisibility(); debouncedSaveState(); });
         if (chunkSizeSlider) {
@@ -1498,26 +1500,48 @@ document.addEventListener('DOMContentLoaded', async function () {
     }
 
     let referencePreviewAudio = null;
+    const PREVIEW_PLAY_HTML = referencePreviewButton ? referencePreviewButton.innerHTML : '';
+    const PREVIEW_STOP_HTML = `<svg class="btn-icon-stack__icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M2 10a8 8 0 1 1 16 0 8 8 0 0 1-16 0Zm6.75-3a.75.75 0 0 0-.75.75v4.5c0 .414.336.75.75.75h2.5a.75.75 0 0 0 .75-.75v-4.5a.75.75 0 0 0-.75-.75h-2.5Z" clip-rule="evenodd" /></svg>Stop Playing`;
+
+    // 'idle' | 'preparing' | 'playing'
+    function setReferencePreviewState(state) {
+        if (!referencePreviewButton) return;
+        referencePreviewButton.disabled = state === 'preparing';
+        if (state === 'preparing') {
+            referencePreviewButton.textContent = 'Preparing...';
+        } else if (state === 'playing') {
+            referencePreviewButton.innerHTML = PREVIEW_STOP_HTML;
+            referencePreviewButton.title = 'Stop playing the sample';
+        } else {
+            referencePreviewButton.innerHTML = PREVIEW_PLAY_HTML;
+            referencePreviewButton.title = 'Play the reference audio as the model will hear it';
+        }
+    }
+
     function stopReferencePreview() {
-        if (!referencePreviewAudio) return;
-        referencePreviewAudio.pause();
-        URL.revokeObjectURL(referencePreviewAudio.src);
-        referencePreviewAudio = null;
+        if (referencePreviewAudio) {
+            referencePreviewAudio.pause();
+            URL.revokeObjectURL(referencePreviewAudio.src);
+            referencePreviewAudio = null;
+        }
+        setReferencePreviewState('idle');
     }
 
     if (referencePreviewButton) {
         referencePreviewButton.addEventListener('click', async () => {
+            // Acts as a toggle: while a sample is playing, the button stops it.
+            if (referencePreviewAudio) {
+                stopReferencePreview();
+                return;
+            }
+
             const filename = cloneReferenceSelect ? cloneReferenceSelect.value : 'none';
             if (!filename || filename === 'none') {
                 showNotification('Select a reference audio file first.', 'warning');
                 return;
             }
-            // A second click restarts the preview with whatever the sliders now say.
-            stopReferencePreview();
 
-            const originalButtonHTML = referencePreviewButton.innerHTML;
-            referencePreviewButton.disabled = true;
-            referencePreviewButton.textContent = 'Preparing...';
+            setReferencePreviewState('preparing');
             try {
                 const params = new URLSearchParams({
                     filename: filename,
@@ -1530,15 +1554,21 @@ document.addEventListener('DOMContentLoaded', async function () {
                     throw new Error(formatErrorDetail(errorResult.detail) || 'Could not prepare the preview.');
                 }
                 const url = URL.createObjectURL(await response.blob());
-                referencePreviewAudio = new Audio(url);
-                referencePreviewAudio.addEventListener('ended', () => URL.revokeObjectURL(url));
-                await referencePreviewAudio.play();
+                const audio = new Audio(url);
+                // Reaching the end and being stopped early land in the same place:
+                // the object URL is released and the button returns to "Play Sample".
+                audio.addEventListener('ended', () => stopReferencePreview());
+                audio.addEventListener('error', () => {
+                    showNotification('Preview could not be played.', 'error');
+                    stopReferencePreview();
+                });
+                referencePreviewAudio = audio;
+                await audio.play();
+                setReferencePreviewState('playing');
             } catch (error) {
                 console.error('Error previewing reference audio:', error);
                 showNotification(`Preview failed: ${error.message}`, 'error');
-            } finally {
-                referencePreviewButton.disabled = false;
-                referencePreviewButton.innerHTML = originalButtonHTML;
+                stopReferencePreview();
             }
         });
     }
