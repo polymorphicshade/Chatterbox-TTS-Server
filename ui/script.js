@@ -1249,7 +1249,8 @@ document.addEventListener('DOMContentLoaded', async function () {
             "audio_output.format": currentConfig.audio_output?.format, "audio_output.sample_rate": currentConfig.audio_output?.sample_rate
         };
         const checkboxFields = {
-            "audio_output.save_to_disk": currentConfig.audio_output?.save_to_disk
+            "audio_output.save_to_disk": currentConfig.audio_output?.save_to_disk,
+            "server.enable_logging": currentConfig.server?.enable_logging
         };
         for (const name in fieldsToDisplay) {
             const input = serverConfigForm.querySelector(`input[name="${name}"]`);

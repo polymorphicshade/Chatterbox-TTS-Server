@@ -430,6 +430,19 @@
                                                     <span>Save generated audio to disk</span>
                                                 </label>
                                             </div>
+                                            <div class="form-group">
+                                                <label for="config-server-enable_logging" class="checkbox-label">
+                                                    <input type="checkbox" id="config-server-enable_logging"
+                                                        name="server.enable_logging" class="form-checkbox">
+                                                    <span>Enable logging</span>
+                                                </label>
+                                                <p class="form-hint">
+                                                    Off by default. While off, nothing you do in the app is
+                                                    recorded — no text, filenames, voices or request lines reach
+                                                    the log file or console. Server start-up and shutdown are
+                                                    still logged. Takes effect as soon as you save.
+                                                </p>
+                                            </div>
                                             <div class="form-grid__full mt-4 flex-row flex-wrap items-center gap-4">
                                                 <button id="save-config-btn" type="button" class="btn ghost">Save Server
                                                     Configuration</button>

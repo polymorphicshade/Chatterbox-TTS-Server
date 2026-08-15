@@ -458,6 +458,7 @@ The following table describes the main sections and some key parameters you migh
 | :-------------------- | :---------------------------- | :------------ | :------------------------------------------------------------------------------------------------------------ | :----------------------- |
 | **`server`**          | `host`                        | string        | IP address the server listens on. `0.0.0.0` for all available interfaces.                                     | `0.0.0.0`                |
 |                       | `port`                        | integer       | Port number for the server.                                                                                   | `8000`                   |
+|                       | `enable_logging`              | boolean       | If false, nothing is logged once the server is serving requests. Startup/shutdown are always logged.           | `false`                  |
 |                       | `log_file_path`               | string        | Path to the server log file (relative to project root or absolute).                                           | `logs/tts_server.log`    |
 |                       | `log_file_max_size_mb`        | integer       | Maximum size of a single log file before rotation.                                                            | `10`                     |
 |                       | `log_file_backup_count`       | integer       | Number of backup log files to keep.                                                                           | `5`                      |
@@ -808,6 +809,7 @@ This section provides guidance on common issues encountered with the Chatterbox 
 *   The primary server log file is specified by `server.log_file_path` in `config.yaml` (default: `logs/tts_server.log` [1]).
 *   Logs are rotated based on `log_file_max_size_mb` and `log_file_backup_count`.
 *   Review these logs for detailed error messages and operational information. Standard output in the terminal also provides real-time logging.
+*   **Activity logging is off by default.** `server.enable_logging` (the **Enable logging** checkbox under *Server Configuration*) is `false` out of the box, and while it is off nothing that happens after startup is written to the log file or the console — no synthesized text, filenames, voices, parameters or request lines. Server startup and shutdown are always logged, so a failed boot stays diagnosable. Tick the box and save to start recording immediately; no restart is needed either way. **Turn it on before reproducing a problem you want to report**, otherwise the log will show the server starting and nothing else.
 
 ---
 

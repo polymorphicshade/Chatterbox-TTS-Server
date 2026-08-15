@@ -3,6 +3,7 @@ server:
   port: 8004
   use_ngrok: false
   use_auth: false
+  enable_logging: false
   auth_username: user
   auth_password: password
   log_file_path: logs/tts_server.log

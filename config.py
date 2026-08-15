@@ -42,6 +42,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "use_auth": False,  # Placeholder for basic authentication (if used).
         "auth_username": "user",  # Default username if authentication is enabled.
         "auth_password": "password",  # Default password if authentication is enabled.
+        "enable_logging": False,  # If false, nothing done in the app is logged once the server is serving.
         "log_file_path": str(
             DEFAULT_LOGS_PATH / "tts_server.log"
         ),  # Path to the server log file.

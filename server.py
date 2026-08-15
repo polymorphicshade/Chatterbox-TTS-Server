@@ -109,6 +109,57 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("watchfiles").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+
+# --- User Activity Logging Switch ---
+# 'server.enable_logging' (default off) decides whether anything is recorded once
+# the server is up and serving. The rule is deliberately blunt: everything logged
+# while serving is, one way or another, a trace of what someone did with the app -
+# the text they synthesized, the files they uploaded, the voices they chose. So
+# once startup finishes, records are dropped unless logging is switched on.
+#
+# Startup and shutdown are always logged: they describe the server's own
+# lifecycle, contain nothing a user did, and are what makes a failed boot
+# diagnosable even with logging off.
+_server_is_serving = False
+_logging_enabled = config_manager.get_bool("server.enable_logging", False)
+
+
+class UserActivityFilter(logging.Filter):
+    """Suppresses log records emitted while serving, unless logging is enabled."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return _logging_enabled or not _server_is_serving
+
+
+_user_activity_filter = UserActivityFilter()
+
+
+def apply_logging_state() -> None:
+    """
+    Refreshes the cached enable_logging flag and makes sure every live handler
+    carries the filter.
+
+    Handler-level filtering is the only reliable interception point: a record
+    propagating up from a child logger skips ancestor *logger* filters, but must
+    pass the filters on every handler that emits it. Uvicorn installs its own
+    handlers after this module is imported, hence re-running this at startup.
+    """
+    global _logging_enabled
+    _logging_enabled = config_manager.get_bool("server.enable_logging", False)
+
+    logger_names = ["uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"]
+    for target in [logging.getLogger()] + [logging.getLogger(n) for n in logger_names]:
+        for handler in target.handlers:
+            if not any(isinstance(f, UserActivityFilter) for f in handler.filters):
+                handler.addFilter(_user_activity_filter)
+
+    # One line per request with method, path and client address - pure user
+    # activity, and it bypasses the app's own loggers entirely.
+    logging.getLogger("uvicorn.access").disabled = not _logging_enabled
+
+
+apply_logging_state()
+
 # --- Global Variables & Application Setup ---
 startup_complete_event = threading.Event()  # For coordinating browser opening
 
@@ -138,6 +189,7 @@ def _delayed_browser_open(host: str, port: int):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manages application startup and shutdown events."""
+    global _server_is_serving
     logger.info("TTS Server: Initializing application...")
     try:
         logger.info(f"Configuration loaded. Log file at: {get_log_file_path()}")
@@ -168,16 +220,29 @@ async def lifespan(app: FastAPI):
             )
             browser_thread.start()
 
+        # Re-run now that uvicorn has installed its own handlers, so they carry
+        # the filter too.
+        apply_logging_state()
+        if not _logging_enabled:
+            logger.info(
+                "Activity logging is off ('server.enable_logging'). Nothing done in "
+                "the app will be recorded until it is switched on."
+            )
+
         logger.info("Application startup sequence complete.")
         startup_complete_event.set()
+        _server_is_serving = True
         yield
     except Exception as e_startup:
         logger.error(
             f"FATAL ERROR during application startup: {e_startup}", exc_info=True
         )
         startup_complete_event.set()
+        _server_is_serving = True
         yield
     finally:
+        # Shutdown is lifecycle, not user activity, so let it through.
+        _server_is_serving = False
         logger.info("TTS Server: Application shutdown sequence initiated...")
         logger.info("TTS Server: Application shutdown complete.")
 
@@ -504,6 +569,28 @@ async def get_ui_initial_data():
 
 
 # --- Configuration Management API Endpoints ---
+# Sections whose settings are only read at startup.
+RESTART_REQUIRED_SECTIONS = ("server", "tts_engine", "paths", "model")
+# Exceptions within those sections that are applied live, so saving them alone
+# must not tell the user to restart. Dotted paths from the config root.
+LIVE_APPLIED_SETTINGS = frozenset({"server.enable_logging"})
+
+
+def _settings_need_restart(partial_update: Dict[str, Any], prefix: str = "") -> bool:
+    """Reports whether a config update touches anything only read at startup."""
+    for key, value in partial_update.items():
+        path = f"{prefix}{key}"
+        if isinstance(value, dict):
+            if _settings_need_restart(value, f"{path}."):
+                return True
+        elif (
+            path.split(".")[0] in RESTART_REQUIRED_SECTIONS
+            and path not in LIVE_APPLIED_SETTINGS
+        ):
+            return True
+    return False
+
+
 @app.post("/save_settings", response_model=UpdateStatusResponse, tags=["Configuration"])
 async def save_settings_endpoint(request: Request):
     """
@@ -518,10 +605,12 @@ async def save_settings_endpoint(request: Request):
         logger.debug(f"Received partial config data to save: {partial_update}")
 
         if config_manager.update_and_save(partial_update):
-            restart_needed = any(
-                key in partial_update
-                for key in ["server", "tts_engine", "paths", "model"]
-            )
+            # Takes effect immediately - a user turning logging off should not have
+            # to restart before it stops recording, nor lose the next few minutes
+            # of diagnostics after turning it on.
+            apply_logging_state()
+
+            restart_needed = _settings_need_restart(partial_update)
             message = "Settings saved successfully."
             if restart_needed:
                 message += " A server restart may be required for some changes to take full effect."
