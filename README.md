@@ -790,7 +790,7 @@ The server relies exclusively on `config.yaml` for runtime configuration.
 *   `tts_engine`: `device` ('auto', 'cuda', 'mps', 'cpu'), `predefined_voices_path`, `reference_audio_path`, `default_voice_id`.
 *   `paths`: `model_cache` (for `download_model.py`), `output`.
 *   `generation_defaults`: Default UI values for `temperature`, `exaggeration`, `cfg_weight`, `seed`, `speed_factor`, `language`.
-*   `audio_output`: `format`, `sample_rate`, `max_reference_duration_sec`.
+*   `audio_output`: `format`, `sample_rate`, `max_reference_duration_sec`, `min_reference_duration_sec`, `reference_combine_gap_ms`.
 *   `ui_state`: Stores the last used text, voice mode, file selections, etc., for UI persistence.
 *   `ui`: `title`, `show_language_select`, `max_predefined_voices_in_dropdown`.
 *   `debug`: `save_intermediate_audio`.

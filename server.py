@@ -10,6 +10,7 @@ import struct
 import logging
 import logging.handlers  # For RotatingFileHandler
 import shutil
+import tempfile
 import time
 import uuid
 import yaml  # For loading presets
@@ -672,74 +673,195 @@ async def upload_reference_audio_endpoint(files: List[UploadFile] = File(...)):
     """
     Handles uploading of reference audio files (.wav, .mp3) for voice cloning.
     Validates files and saves them to the configured reference audio path.
+
+    Clips shorter than 'audio_output.min_reference_duration_sec' are unusable on
+    their own for cloning, so when two or more of them arrive in the same upload
+    they are chained into a single reference file, separated by
+    'audio_output.reference_combine_gap_ms' of silence. Files that already meet
+    the minimum are saved individually, exactly as before.
+
+    Uploads are staged in a temporary directory first, so a batch that gets
+    combined leaves only the combined file behind rather than its parts.
     """
     logger.info(f"Request to /upload_reference with {len(files)} file(s).")
     ref_path = get_reference_audio_path(ensure_absolute=True)
+    max_duration = config_manager.get_int("audio_output.max_reference_duration_sec", 30)
+    min_duration = config_manager.get_float(
+        "audio_output.min_reference_duration_sec", 5.0
+    )
+    gap_ms = config_manager.get_int("audio_output.reference_combine_gap_ms", 3000)
+
     uploaded_filenames_successfully: List[str] = []
     upload_errors: List[Dict[str, str]] = []
+    upload_warnings: List[Dict[str, str]] = []
+    combined_filename: Optional[str] = None
+    combined_sources: List[str] = []
 
-    for file in files:
-        if not file.filename:
-            upload_errors.append(
-                {"filename": "Unknown", "error": "File received with no filename."}
-            )
-            logger.warning("Upload attempt with no filename.")
-            continue
+    # (safe_filename, staged_path, duration_sec_or_None)
+    staged_files: List[tuple] = []
 
-        safe_filename = utils.sanitize_filename(file.filename)
-        destination_path = ref_path / safe_filename
+    with tempfile.TemporaryDirectory(prefix="ref_upload_") as staging_dir_str:
+        staging_dir = Path(staging_dir_str)
 
-        try:
-            if not (
-                safe_filename.lower().endswith(".wav")
-                or safe_filename.lower().endswith(".mp3")
-            ):
-                raise ValueError("Invalid file type. Only .wav and .mp3 are allowed.")
-
-            if destination_path.exists():
-                logger.info(
-                    f"Reference file '{safe_filename}' already exists. Skipping duplicate upload."
+        for file in files:
+            if not file.filename:
+                upload_errors.append(
+                    {"filename": "Unknown", "error": "File received with no filename."}
                 )
-                if safe_filename not in uploaded_filenames_successfully:
-                    uploaded_filenames_successfully.append(safe_filename)
+                logger.warning("Upload attempt with no filename.")
                 continue
 
-            with open(destination_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            logger.info(
-                f"Successfully saved uploaded reference file to: {destination_path}"
-            )
+            safe_filename = utils.sanitize_filename(file.filename)
 
-            max_duration = config_manager.get_int(
-                "audio_output.max_reference_duration_sec", 30
-            )
-            is_valid, validation_msg = utils.validate_reference_audio(
-                destination_path, max_duration
-            )
-            if not is_valid:
-                logger.warning(
-                    f"Uploaded file '{safe_filename}' failed validation: {validation_msg}. Deleting."
+            try:
+                if not (
+                    safe_filename.lower().endswith(".wav")
+                    or safe_filename.lower().endswith(".mp3")
+                ):
+                    raise ValueError(
+                        "Invalid file type. Only .wav and .mp3 are allowed."
+                    )
+
+                if (ref_path / safe_filename).exists():
+                    logger.info(
+                        f"Reference file '{safe_filename}' already exists. Skipping duplicate upload."
+                    )
+                    if safe_filename not in uploaded_filenames_successfully:
+                        uploaded_filenames_successfully.append(safe_filename)
+                    continue
+
+                staged_path = utils.get_unique_destination(staging_dir, safe_filename)
+                with open(staged_path, "wb") as buffer:
+                    shutil.copyfileobj(file.file, buffer)
+
+                is_valid, validation_msg = utils.validate_reference_audio(
+                    staged_path, max_duration
                 )
-                destination_path.unlink(missing_ok=True)
+                if not is_valid:
+                    logger.warning(
+                        f"Uploaded file '{safe_filename}' failed validation: {validation_msg}. Discarding."
+                    )
+                    upload_errors.append(
+                        {"filename": safe_filename, "error": validation_msg}
+                    )
+                    continue
+
+                duration = utils.get_audio_duration(staged_path)
+                staged_files.append((safe_filename, staged_path, duration))
+
+            except Exception as e_upload:
+                error_msg = f"Error processing file '{file.filename}': {str(e_upload)}"
+                logger.error(error_msg, exc_info=True)
                 upload_errors.append(
-                    {"filename": safe_filename, "error": validation_msg}
+                    {"filename": file.filename, "error": str(e_upload)}
                 )
-            else:
-                uploaded_filenames_successfully.append(safe_filename)
+            finally:
+                await file.close()
 
-        except Exception as e_upload:
-            error_msg = f"Error processing file '{file.filename}': {str(e_upload)}"
-            logger.error(error_msg, exc_info=True)
-            upload_errors.append({"filename": file.filename, "error": str(e_upload)})
-        finally:
-            await file.close()
+        # A clip of unknown duration is treated as long enough: better to save it
+        # untouched than to splice it into something the user did not ask for.
+        too_short = [s for s in staged_files if s[2] is not None and s[2] < min_duration]
+        keep_separate = [s for s in staged_files if s not in too_short]
+
+        if len(too_short) >= 2:
+            gap_total_sec = (gap_ms / 1000.0) * (len(too_short) - 1)
+            projected_duration = sum(s[2] for s in too_short) + gap_total_sec
+
+            if projected_duration > max_duration:
+                # Saving the pieces individually beats failing the upload outright;
+                # the user keeps their audio and can retry with fewer clips.
+                logger.warning(
+                    f"Combining {len(too_short)} clips would produce {projected_duration:.2f}s, "
+                    f"over the {max_duration}s maximum. Saving them individually instead."
+                )
+                upload_warnings.append(
+                    {
+                        "filename": ", ".join(s[0] for s in too_short),
+                        "warning": (
+                            f"Chaining these {len(too_short)} clips would produce "
+                            f"{projected_duration:.1f}s of audio (including {gap_total_sec:.1f}s of "
+                            f"inserted silence), which exceeds the {max_duration}s maximum. "
+                            f"They were saved individually — re-upload fewer clips at a time to chain them."
+                        ),
+                    }
+                )
+                keep_separate.extend(too_short)
+            else:
+                base_stem = Path(too_short[0][0]).stem
+                destination_path = utils.get_unique_destination(
+                    ref_path, f"{base_stem}_combined.wav"
+                )
+                success, combine_msg, combined_duration = utils.concatenate_audio_files(
+                    [s[1] for s in too_short], destination_path, gap_ms
+                )
+
+                if success:
+                    combined_filename = destination_path.name
+                    combined_sources = [s[0] for s in too_short]
+                    uploaded_filenames_successfully.insert(0, combined_filename)
+                    logger.info(
+                        f"Chained {len(too_short)} short clip(s) into '{combined_filename}': {combine_msg}"
+                    )
+                    # Judge against speech content, not padded length: the inserted
+                    # silence lengthens the file without giving the model more voice
+                    # to work from, so it must not satisfy the minimum on its own.
+                    content_duration = sum(s[2] for s in too_short)
+                    if content_duration < min_duration:
+                        upload_warnings.append(
+                            {
+                                "filename": combined_filename,
+                                "warning": (
+                                    f"Combined reference is {combined_duration:.1f}s, but only "
+                                    f"{content_duration:.1f}s of that is speech — under the "
+                                    f"{min_duration:.0f}s recommended minimum. Cloning quality may suffer; "
+                                    f"add more clips and upload them together."
+                                ),
+                            }
+                        )
+                else:
+                    upload_errors.append(
+                        {
+                            "filename": ", ".join(s[0] for s in too_short),
+                            "error": combine_msg,
+                        }
+                    )
+                    keep_separate.extend(too_short)
+        elif len(too_short) == 1:
+            # Nothing to chain it with; save it, but say why it may disappoint.
+            upload_warnings.append(
+                {
+                    "filename": too_short[0][0],
+                    "warning": (
+                        f"This clip is {too_short[0][2]:.1f}s, under the {min_duration:.0f}s recommended "
+                        f"minimum for cloning. Upload it together with other short clips and they will be "
+                        f"chained into one reference automatically."
+                    ),
+                }
+            )
+            keep_separate.extend(too_short)
+
+        for safe_filename, staged_path, _duration in keep_separate:
+            try:
+                destination_path = utils.get_unique_destination(ref_path, safe_filename)
+                shutil.move(str(staged_path), str(destination_path))
+                logger.info(
+                    f"Successfully saved uploaded reference file to: {destination_path}"
+                )
+                uploaded_filenames_successfully.append(destination_path.name)
+            except Exception as e_move:
+                error_msg = f"Error saving file '{safe_filename}': {str(e_move)}"
+                logger.error(error_msg, exc_info=True)
+                upload_errors.append({"filename": safe_filename, "error": str(e_move)})
 
     all_current_reference_files = utils.get_valid_reference_files()
     response_data = {
         "message": f"Processed {len(files)} file(s).",
         "uploaded_files": uploaded_filenames_successfully,
         "all_reference_files": all_current_reference_files,
+        "combined_file": combined_filename,
+        "combined_from": combined_sources,
         "errors": upload_errors,
+        "warnings": upload_warnings,
     }
     status_code = (
         200 if not upload_errors or len(uploaded_filenames_successfully) > 0 else 400

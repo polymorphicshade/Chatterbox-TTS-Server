@@ -479,6 +479,8 @@ The following table describes the main sections and some key parameters you migh
 | **`audio_output`**    | `format`                      | string        | Default output audio format (e.g., `wav`, `opus`).                                                            | `wav`                    |
 |                       | `sample_rate`                 | integer       | Target sample rate for output audio files (e.g., `24000`, `48000`). Resampling applied if needed.              | `24000`                  |
 |                       | `max_reference_duration_sec`  | integer       | Maximum duration for reference audio files for cloning.                                                       | `30`                     |
+|                       | `min_reference_duration_sec`  | integer       | Reference clips shorter than this are chained together when uploaded in the same batch.                       | `5`                      |
+|                       | `reference_combine_gap_ms`    | integer       | Silence inserted between chained reference clips, in milliseconds.                                            | `3000`                   |
 | **`ui_state`**        | `last_text`                   | string        | Last text entered in the UI.                                                                                  | `""`                     |
 |                       | `last_voice_mode`             | string        | Last selected voice mode (`predefined` or `clone`).                                                           | `predefined`             |
 |                       | `last_predefined_voice`       | string/null   | Filename of the last used predefined voice.                                                                   | `null`                   |
@@ -582,6 +584,7 @@ The server allows generating speech in a voice cloned from a reference audio sam
     *   Files are uploaded to or placed in the directory specified by `tts_engine.reference_audio_path` (default: `./reference_audio/`) [1].
     *   Quality of the reference audio (clear speech, minimal noise) significantly impacts clone quality.
     *   Duration is also a factor; refer to `audio_output.max_reference_duration_sec` in `config.yaml`.
+    *   **Chaining short clips:** A single clip shorter than `audio_output.min_reference_duration_sec` (default `5`) rarely clones well. Uploading two or more such clips in one go joins them into a single reference file, in the order they were selected, separated by `audio_output.reference_combine_gap_ms` of silence (default `3000`). The combined file is named after the first clip (e.g. `sample_combined.wav`), only that file is kept, and it is selected automatically in the UI. Clips that already meet the minimum are still saved individually. If the chained result would exceed `max_reference_duration_sec`, the clips are saved individually instead and a warning explains why.
 *   **Usage:**
     *   UI: Select "Voice Clone" mode, choose a reference file.
     *   API (`/tts`): Set `voice_mode` to `clone` and provide `reference_audio_filename`.

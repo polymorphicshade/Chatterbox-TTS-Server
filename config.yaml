@@ -29,6 +29,8 @@ audio_output:
   format: wav
   sample_rate: 24000
   max_reference_duration_sec: 30
+  min_reference_duration_sec: 5
+  reference_combine_gap_ms: 3000
   save_to_disk: false
 ui_state:
   last_text: '[gasp] Okay, we have fifteen minutes left! Fifteen minutes! [groan]

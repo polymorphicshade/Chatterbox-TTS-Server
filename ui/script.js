@@ -1399,8 +1399,14 @@ document.addEventListener('DOMContentLoaded', async function () {
             if (result.errors && result.errors.length > 0) {
                 result.errors.forEach(err => showNotification(`Upload Warning: ${err.filename || 'File'} - ${err.error}`, 'warning', 10000));
             }
+            if (result.warnings && result.warnings.length > 0) {
+                result.warnings.forEach(w => showNotification(`${w.filename || 'File'}: ${w.warning}`, 'warning', 12000));
+            }
             const successfulUploads = result.uploaded_files || [];
-            if (successfulUploads.length > 0) {
+            if (result.combined_file) {
+                const sources = result.combined_from || [];
+                showNotification(`Chained ${sources.length} short clips into ${result.combined_file}`, 'success', 8000);
+            } else if (successfulUploads.length > 0) {
                 showNotification(`Successfully uploaded: ${successfulUploads.join(', ')}`, 'success');
             } else if (!result.errors || result.errors.length === 0) {
                 showNotification("Files processed. No new valid files were added or an issue occurred.", 'info');
@@ -1425,9 +1431,11 @@ document.addEventListener('DOMContentLoaded', async function () {
         cloneFileInput.addEventListener('change', () => handleFileUpload(cloneFileInput, '/upload_reference', (result) => {
             initialReferenceFiles = result.all_reference_files || [];
             populateReferenceFiles();
-            const firstUploaded = result.uploaded_files?.[0];
-            if (firstUploaded && cloneReferenceSelect && Array.from(cloneReferenceSelect.options).some(opt => opt.value === firstUploaded)) {
-                cloneReferenceSelect.value = firstUploaded;
+            // Prefer the chained file when the batch was combined, so the voice the
+            // user actually intended to build is the one selected.
+            const fileToSelect = result.combined_file || result.uploaded_files?.[0];
+            if (fileToSelect && cloneReferenceSelect && Array.from(cloneReferenceSelect.options).some(opt => opt.value === fileToSelect)) {
+                cloneReferenceSelect.value = fileToSelect;
             }
         }, cloneImportButton));
     }

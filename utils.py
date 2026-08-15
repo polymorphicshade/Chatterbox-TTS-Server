@@ -1246,6 +1246,148 @@ def validate_reference_audio(
     return True, "Reference audio appears valid."
 
 
+def get_audio_duration(file_path: Path) -> Optional[float]:
+    """
+    Returns the duration of an audio file in seconds, or None if it cannot be read.
+
+    Tries soundfile first (cheap, header-only) and falls back to pydub, which
+    decodes via ffmpeg and therefore copes with MP3 builds that libsndfile
+    cannot open.
+
+    Args:
+        file_path: Path object for the audio file.
+
+    Returns:
+        Duration in seconds, or None if the file could not be inspected.
+    """
+    try:
+        duration = sf.info(str(file_path)).duration
+        if duration > 0:
+            return float(duration)
+    except Exception as e_sf:
+        logger.debug(
+            f"soundfile could not read duration of '{file_path.name}': {e_sf}. Trying pydub."
+        )
+
+    try:
+        return len(AudioSegment.from_file(str(file_path))) / 1000.0
+    except Exception as e_pydub:
+        logger.warning(f"Could not determine duration of '{file_path.name}': {e_pydub}")
+        return None
+
+
+def concatenate_audio_files(
+    source_paths: List[Path],
+    destination_path: Path,
+    gap_ms: int = 3000,
+) -> Tuple[bool, str, float]:
+    """
+    Chains several audio files into a single WAV file, separated by silence.
+
+    Used to build one usable voice-cloning reference out of several short clips.
+    Inputs may differ in format, sample rate and channel count; everything is
+    converted to the highest sample rate present, and to mono if any input is
+    mono, so the pieces splice together without artifacts.
+
+    Args:
+        source_paths: Files to join, in the order they should be heard.
+        destination_path: Where to write the combined WAV.
+        gap_ms: Silence inserted between consecutive clips, in milliseconds.
+            Applied between clips only, never at the start or end.
+
+    Returns:
+        A tuple (success: bool, message: str, duration_sec: float). On failure
+        duration_sec is 0.0 and no file is written.
+    """
+    if not source_paths:
+        return False, "No audio files were supplied to concatenate.", 0.0
+
+    start_time = time.time()
+    segments: List[AudioSegment] = []
+    try:
+        for path in source_paths:
+            try:
+                segments.append(AudioSegment.from_file(str(path)))
+            except Exception as e_load:
+                return (
+                    False,
+                    f"Could not decode '{path.name}' for combining: {e_load}",
+                    0.0,
+                )
+
+        # Match the best quality present rather than whatever the first clip
+        # happens to be; downmix to mono only if some input already is.
+        target_frame_rate = max(seg.frame_rate for seg in segments)
+        target_channels = min(seg.channels for seg in segments)
+        segments = [
+            seg.set_frame_rate(target_frame_rate).set_channels(target_channels)
+            for seg in segments
+        ]
+
+        silence = (
+            AudioSegment.silent(duration=gap_ms, frame_rate=target_frame_rate)
+            .set_channels(target_channels)
+            if gap_ms > 0
+            else None
+        )
+
+        combined = segments[0]
+        for seg in segments[1:]:
+            if silence is not None:
+                combined += silence
+            combined += seg
+
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        # 16-bit PCM, matching what save_audio_to_file writes elsewhere.
+        combined = combined.set_sample_width(2)
+        combined.export(str(destination_path), format="wav")
+
+        duration_sec = len(combined) / 1000.0
+        logger.info(
+            f"Combined {len(source_paths)} clip(s) into '{destination_path.name}' "
+            f"({duration_sec:.2f}s, {target_frame_rate}Hz, {target_channels}ch, "
+            f"{gap_ms}ms gaps) in {time.time() - start_time:.3f} seconds."
+        )
+        return (
+            True,
+            f"Combined {len(source_paths)} clips into a {duration_sec:.2f}s reference.",
+            duration_sec,
+        )
+
+    except Exception as e:
+        logger.error(
+            f"Error combining audio files into '{destination_path}': {e}", exc_info=True
+        )
+        destination_path.unlink(missing_ok=True)
+        return False, f"Failed to combine audio files: {e}", 0.0
+
+
+def get_unique_destination(directory: Path, filename: str) -> Path:
+    """
+    Returns a path inside `directory` that does not collide with an existing file,
+    appending _2, _3, ... to the stem until the name is free.
+
+    Args:
+        directory: Directory the file will be written to.
+        filename: Desired filename, already sanitized.
+
+    Returns:
+        A Path that does not currently exist.
+    """
+    candidate = directory / filename
+    if not candidate.exists():
+        return candidate
+
+    stem = candidate.stem
+    suffix = candidate.suffix
+    counter = 2
+    while True:
+        candidate = directory / f"{stem}_{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
 # --- Performance Monitoring Utility ---
 class PerformanceMonitor:
     """
