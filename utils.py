@@ -8,6 +8,8 @@ import hashlib
 import importlib.util
 import logging
 import re
+import shutil
+import subprocess
 import time
 import io
 import uuid
@@ -492,14 +494,164 @@ def save_audio_tensor_to_file(
 
 
 # --- Audio Manipulation Utilities ---
+#
+# Changing talking speed is a time-stretch, and the algorithm matters far more
+# than the amount. A phase vocoder - librosa.effects.time_stretch at its default
+# 2048-sample window, i.e. 85ms at 24kHz - resynthesises each frame from a
+# magnitude spectrum plus an integrated phase estimate, with no phase locking
+# across bins. Every plosive and onset gets smeared across that whole window and
+# the partials of a vowel drift out of phase relative to each other. On speech
+# that reads as echo or reverb rather than as a faster talker.
+#
+# WSOLA-family stretching avoids this entirely: it splices overlapping slices of
+# the original waveform at the offsets where they correlate best, so waveform
+# phase is never reconstructed and transients survive intact. ffmpeg's 'atempo'
+# filter is a WSOLA implementation, and ffmpeg is already required here for
+# pydub's decoding and for mp3/opus encoding, so it costs no new dependency.
+
+_FFMPEG_BIN: Optional[str] = None
+_FFMPEG_LOOKUP_DONE = False
+
+
+def _find_ffmpeg() -> Optional[str]:
+    """
+    Returns a usable ffmpeg executable path, or None. Resolved once per process.
+
+    Prefers whatever pydub has been pointed at, so a custom AudioSegment.converter
+    keeps working here too.
+    """
+    global _FFMPEG_BIN, _FFMPEG_LOOKUP_DONE
+    if _FFMPEG_LOOKUP_DONE:
+        return _FFMPEG_BIN
+
+    _FFMPEG_LOOKUP_DONE = True
+    candidate = getattr(AudioSegment, "converter", None)
+    if candidate:
+        if os.path.isfile(candidate):
+            _FFMPEG_BIN = candidate
+        else:
+            _FFMPEG_BIN = shutil.which(candidate)
+    if not _FFMPEG_BIN:
+        _FFMPEG_BIN = shutil.which("ffmpeg")
+
+    if _FFMPEG_BIN:
+        logger.info(f"ffmpeg located for time stretching: {_FFMPEG_BIN}")
+    else:
+        logger.warning(
+            "ffmpeg not found. Speed adjustment will fall back to a phase vocoder, "
+            "which can sound smeared or echoey on speech."
+        )
+    return _FFMPEG_BIN
+
+
+def _atempo_chain(speed_factor: float) -> str:
+    """
+    Builds an ffmpeg filter string for a speed factor.
+
+    A single atempo stage is only well defined between 0.5x and 2.0x, so factors
+    outside that range are expressed as a chain of in-range stages whose product
+    is the requested factor.
+    """
+    stages: List[float] = []
+    remaining = speed_factor
+    while remaining > 2.0:
+        stages.append(2.0)
+        remaining /= 2.0
+    while remaining < 0.5:
+        stages.append(0.5)
+        remaining /= 0.5
+    stages.append(remaining)
+    return ",".join(f"atempo={stage:.6f}" for stage in stages)
+
+
+def _time_stretch_ffmpeg(
+    audio_np: np.ndarray, sample_rate: int, speed_factor: float
+) -> Optional[np.ndarray]:
+    """
+    Time-stretches mono float32 audio with ffmpeg's atempo (WSOLA) filter.
+
+    Raw f32le is piped both ways so no temp file or container header is involved.
+    Returns None if ffmpeg is missing or the call fails, leaving the caller to
+    fall back.
+    """
+    ffmpeg_bin = _find_ffmpeg()
+    if not ffmpeg_bin:
+        return None
+
+    cmd = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-f", "f32le",
+        "-ar", str(sample_rate),
+        "-ac", "1",
+        "-i", "pipe:0",
+        "-filter:a", _atempo_chain(speed_factor),
+        "-f", "f32le",
+        "-ar", str(sample_rate),
+        "-ac", "1",
+        "pipe:1",
+    ]
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            input=np.ascontiguousarray(audio_np, dtype=np.float32).tobytes(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=300,
+        )
+    except Exception as e:
+        logger.warning(f"ffmpeg time stretch could not be run: {e}")
+        return None
+
+    if completed.returncode != 0:
+        logger.warning(
+            f"ffmpeg time stretch failed (exit {completed.returncode}): "
+            f"{completed.stderr.decode('utf-8', 'replace').strip()}"
+        )
+        return None
+
+    stretched = np.frombuffer(completed.stdout, dtype=np.float32)
+    if stretched.size == 0:
+        logger.warning("ffmpeg time stretch produced no samples.")
+        return None
+    return stretched.copy()  # Detach from the read-only bytes buffer.
+
+
+def _time_stretch_librosa(
+    audio_np: np.ndarray, sample_rate: int, speed_factor: float
+) -> Optional[np.ndarray]:
+    """
+    Phase-vocoder time stretch, used only when ffmpeg is unavailable.
+
+    The window is dropped to roughly 21ms rather than librosa's 85ms default.
+    That keeps the smearing shorter than a syllable, which is a good deal less
+    audible on speech, though it does not remove the artifact the way WSOLA does.
+    """
+    if not LIBROSA_AVAILABLE:
+        return None
+
+    n_fft = max(256, int(2 ** round(np.log2(sample_rate * 0.021))))
+    try:
+        return librosa.effects.time_stretch(
+            y=audio_np, rate=speed_factor, n_fft=n_fft, hop_length=n_fft // 4
+        )
+    except Exception as e:
+        logger.error(f"librosa time stretch failed: {e}", exc_info=True)
+        return None
+
+
 def apply_speed_factor(
     audio_tensor: torch.Tensor, sample_rate: int, speed_factor: float
 ) -> Tuple[torch.Tensor, int]:
     """
-    Applies a speed factor to an audio tensor.
-    Uses librosa.effects.time_stretch if available for pitch preservation.
-    Falls back to simple resampling via torchaudio.transforms.Resample if librosa is not available,
-    which will alter pitch.
+    Applies a speed factor to an audio tensor, preserving pitch.
+
+    Prefers ffmpeg's atempo (WSOLA) and falls back to a short-window phase
+    vocoder via librosa. If neither is available the audio is returned unchanged
+    rather than resampled, since resampling would shift pitch as well as tempo.
 
     Args:
         audio_tensor: Input audio waveform (PyTorch tensor, expected mono).
@@ -519,7 +671,7 @@ def apply_speed_factor(
         return audio_tensor, sample_rate
 
     audio_tensor_cpu = audio_tensor.cpu()
-    # Ensure tensor is 1D mono for librosa and consistent handling
+    # Ensure tensor is 1D mono for consistent handling
     if audio_tensor_cpu.ndim == 2:
         if audio_tensor_cpu.shape[0] == 1:
             audio_tensor_cpu = audio_tensor_cpu.squeeze(0)
@@ -537,58 +689,40 @@ def apply_speed_factor(
         )
         return audio_tensor, sample_rate
 
-    if LIBROSA_AVAILABLE:
-        try:
-            audio_np = audio_tensor_cpu.numpy()
-            # librosa.effects.time_stretch changes duration, not sample rate directly.
-            # The 'rate' parameter in time_stretch is equivalent to speed_factor.
-            stretched_audio_np = librosa.effects.time_stretch(
-                y=audio_np, rate=speed_factor
-            )
-            speed_adjusted_tensor = torch.from_numpy(stretched_audio_np)
-            logger.info(
-                f"Applied speed factor {speed_factor} using librosa.effects.time_stretch. Original SR: {sample_rate}"
-            )
-            return speed_adjusted_tensor, sample_rate  # Sample rate is preserved
-        except Exception as e_librosa:
-            logger.error(
-                f"Failed to apply speed factor {speed_factor} using librosa: {e_librosa}. "
-                f"Falling back to basic resampling (pitch will change).",
-                exc_info=True,
-            )
-            # Fallback to simple resampling (changes pitch)
-            try:
-                new_sample_rate_for_speedup = int(sample_rate / speed_factor)
-                resampler = torchaudio.transforms.Resample(
-                    orig_freq=sample_rate, new_freq=new_sample_rate_for_speedup
-                )
-                # Resample to new_sample_rate_for_speedup to change duration, then resample back to original SR
-                # This is effectively what sox 'speed' does, but 'tempo' is better (which librosa does)
-                # For simplicity in fallback, just resample and note pitch change
-                # To actually change speed without changing sample rate and preserving pitch using *only* torchaudio is more complex
-                # and typically involves phase vocoder or similar, which is beyond a simple fallback.
-                # The torchaudio.functional.pitch_shift and then torchaudio.functional.speed is one way,
-                # but librosa is simpler.
-                # Given the instruction "Fallback to original audio" if librosa not available or fails, we'll stick to that.
-                # Original plan: "If Librosa is not available, log a warning and return the original audio"
-                logger.warning(
-                    f"Librosa failed for speed factor. Returning original audio as primary fallback."
-                )
-                return audio_tensor, sample_rate
+    audio_np = audio_tensor_cpu.numpy().astype(np.float32, copy=False)
 
-            except Exception as e_resample_fallback:
-                logger.error(
-                    f"Fallback resampling for speed factor {speed_factor} also failed: {e_resample_fallback}. Returning original audio.",
-                    exc_info=True,
-                )
-                return audio_tensor, sample_rate
+    stretched = _time_stretch_ffmpeg(audio_np, sample_rate, speed_factor)
+    method = "ffmpeg atempo (WSOLA)"
+    if stretched is None:
+        stretched = _time_stretch_librosa(audio_np, sample_rate, speed_factor)
+        method = "librosa phase vocoder (short window)"
 
-    else:  # Librosa not available
+    if stretched is None:
         logger.warning(
-            f"Librosa not available for pitch-preserving speed adjustment (factor: {speed_factor}). "
-            f"Returning original audio. Install librosa for this feature."
+            f"No time-stretch backend available for speed factor {speed_factor}. "
+            f"Returning original audio. Install ffmpeg or librosa for this feature."
         )
         return audio_tensor, sample_rate
+
+    logger.info(
+        f"Applied speed factor {speed_factor} using {method}. SR unchanged: {sample_rate}"
+    )
+    return torch.from_numpy(stretched), sample_rate  # Sample rate is preserved
+
+
+def apply_speed_factor_np(
+    audio_np: np.ndarray, sample_rate: int, speed_factor: float
+) -> np.ndarray:
+    """
+    NumPy-facing form of apply_speed_factor, matching the other whole-clip
+    post-processors (trim_lead_trail_silence, fix_internal_silence).
+    """
+    if speed_factor == 1.0:
+        return audio_np
+
+    tensor = torch.from_numpy(np.ascontiguousarray(audio_np, dtype=np.float32))
+    stretched_tensor, _ = apply_speed_factor(tensor, sample_rate, speed_factor)
+    return stretched_tensor.numpy().astype(np.float32, copy=False)
 
 
 def trim_lead_trail_silence(

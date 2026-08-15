@@ -1405,6 +1405,9 @@ async def custom_tts_endpoint(
                     logger.error(f"Streaming TTS: engine returned None for chunk {i+1}; stopping stream.")
                     return
 
+                # Streaming has no finished clip to stretch, so this stays
+                # per-chunk. Chunks are sentence-sized, which is long enough
+                # that restarting the stretcher at each boundary is inaudible.
                 if speed_factor_stream != 1.0:
                     audio_tensor, _ = utils.apply_speed_factor(
                         audio_tensor, chunk_sr, speed_factor_stream
@@ -1492,18 +1495,11 @@ async def custom_tts_endpoint(
 
             current_processed_audio_tensor = chunk_audio_tensor
 
-            speed_factor_to_use = (
-                request.speed_factor
-                if request.speed_factor is not None
-                else get_gen_default_speed_factor()
-            )
-            if speed_factor_to_use != 1.0:
-                current_processed_audio_tensor, _ = utils.apply_speed_factor(
-                    current_processed_audio_tensor,
-                    chunk_sr_from_engine,
-                    speed_factor_to_use,
-                )
-                perf_monitor.record(f"Speed factor applied to chunk {i+1}")
+            # Speed is deliberately NOT applied here. Stretching every chunk
+            # separately restarts the stretcher's analysis at each boundary and
+            # leaves the stitched-in sentence pauses at their original length,
+            # so a "faster" voice still pauses at normal speed. It is applied
+            # once to the finished, stitched clip instead - see below.
 
             # ### MODIFICATION ###
             # All other processing is REMOVED from the loop.
@@ -1682,6 +1678,21 @@ async def custom_tts_endpoint(
             status_code=500, detail=f"Audio stitching error: {e_concat}"
         )
 
+    # --- Talking speed (applied once, to the complete clip) ---
+    # Placed after silence trimming and the internal-silence fix, whose
+    # thresholds are tuned against natural-tempo speech, and after stitching so
+    # that sentence pauses scale with the voice instead of staying fixed.
+    speed_factor_to_use = (
+        request.speed_factor
+        if request.speed_factor is not None
+        else get_gen_default_speed_factor()
+    )
+    if speed_factor_to_use != 1.0:
+        final_audio_np = utils.apply_speed_factor_np(
+            final_audio_np, engine_output_sample_rate, speed_factor_to_use
+        )
+        perf_monitor.record(f"Speed factor {speed_factor_to_use} applied to full clip")
+
     output_format_str = (
         request.output_format if request.output_format else get_audio_output_format()
     )
@@ -1846,9 +1857,7 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
             if engine_sr is None:
                 engine_sr = sr
 
-            if request.speed != 1.0:
-                audio_tensor, _ = utils.apply_speed_factor(audio_tensor, sr, request.speed)
-
+            # Speed is applied once to the stitched clip below, not per chunk.
             chunk_np = audio_tensor.cpu().numpy().squeeze().astype(np.float32)
             all_audio_segments_np.append(chunk_np)
 
@@ -1870,6 +1879,13 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
             final_audio_np = result
             logger.info(
                 f"OpenAI speech: stitched {len(all_audio_segments_np)} chunks with {CROSSFADE_MS}ms crossfades"
+            )
+
+        # Talking speed, applied once to the stitched clip so that the sentence
+        # pauses scale with the voice and the stretcher runs a single pass.
+        if request.speed != 1.0:
+            final_audio_np = utils.apply_speed_factor_np(
+                final_audio_np, engine_sr, request.speed
             )
 
         # Normalize to prevent clipping
