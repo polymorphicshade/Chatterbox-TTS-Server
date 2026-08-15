@@ -243,6 +243,44 @@
                                     Runs imported clips through DeepFilterNet to strip background noise,
                                     before any chaining. Applies to new imports only.
                                 </p>
+
+                                <div class="mt-4">
+                                    <label class="form-label mb-2">Adjust Reference Voice</label>
+                                    <p class="form-hint mb-2">
+                                        Changes the reference audio before the model hears it, without
+                                        altering the saved file. Pitch and speed move independently.
+                                    </p>
+                                    <div class="flex-row flex-wrap items-center gap-4">
+                                        <div class="flex-row items-center gap-2">
+                                            <label for="reference-pitch-slider" class="form-label small">Pitch:</label>
+                                            <input type="range" id="reference-pitch-slider" name="reference_pitch"
+                                                min="-12" max="12" step="0.5" value="0" class="form-slider short">
+                                            <span id="reference-pitch-value"
+                                                class="slider-value tabular-nums">0 st</span>
+                                        </div>
+                                        <div class="flex-row items-center gap-2">
+                                            <label for="reference-speed-slider" class="form-label small">Speed:</label>
+                                            <input type="range" id="reference-speed-slider" name="reference_speed"
+                                                min="0.5" max="2" step="0.05" value="1" class="form-slider short">
+                                            <span id="reference-speed-value"
+                                                class="slider-value tabular-nums">1.00x</span>
+                                        </div>
+                                        <button type="button" id="reference-preview-button" class="btn-icon-stack"
+                                            title="Play the reference audio as the model will hear it">
+                                            <svg class="btn-icon-stack__icon" xmlns="http://www.w3.org/2000/svg"
+                                                viewBox="0 0 20 20" fill="currentColor">
+                                                <path fill-rule="evenodd"
+                                                    d="M2 10a8 8 0 1 1 16 0 8 8 0 0 1-16 0Zm6.39-2.908a.75.75 0 0 1 .766.027l3.5 2.25a.75.75 0 0 1 0 1.262l-3.5 2.25A.75.75 0 0 1 8 12.25v-4.5a.75.75 0 0 1 .39-.658Z"
+                                                    clip-rule="evenodd" />
+                                            </svg>
+                                            Play Sample
+                                        </button>
+                                        <button type="button" id="reference-reset-button" class="btn-icon-stack"
+                                            title="Reset pitch and speed">
+                                            Reset
+                                        </button>
+                                    </div>
+                                </div>
                             </div>
 
                             <div class="form-group">

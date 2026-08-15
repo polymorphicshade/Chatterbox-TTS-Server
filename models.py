@@ -60,6 +60,18 @@ class CustomTTSRequest(BaseModel):
         None,
         description="Filename of a user-uploaded reference audio for voice cloning. Required if voice_mode is 'clone'.",
     )
+    reference_pitch: Optional[float] = Field(
+        0.0,
+        ge=-12.0,
+        le=12.0,
+        description="Semitones to shift the reference audio by before the model hears it. 0 leaves it unchanged. Timing is preserved.",
+    )
+    reference_speed: Optional[float] = Field(
+        1.0,
+        ge=0.5,
+        le=2.0,
+        description="Speed factor applied to the reference audio before the model hears it. 1.0 leaves it unchanged. Pitch is preserved.",
+    )
 
     output_format: Optional[Literal["wav", "opus", "mp3"]] = Field(  # Added "mp3"
         "wav", description="Desired audio output format."  # Default output format

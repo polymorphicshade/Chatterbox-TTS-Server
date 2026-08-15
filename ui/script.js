@@ -90,6 +90,12 @@ document.addEventListener('DOMContentLoaded', async function () {
     const cloneImportButton = document.getElementById('clone-import-button');
     const cloneRefreshButton = document.getElementById('clone-refresh-button');
     const denoiseToggle = document.getElementById('denoise-toggle');
+    const referencePitchSlider = document.getElementById('reference-pitch-slider');
+    const referencePitchValue = document.getElementById('reference-pitch-value');
+    const referenceSpeedSlider = document.getElementById('reference-speed-slider');
+    const referenceSpeedValue = document.getElementById('reference-speed-value');
+    const referencePreviewButton = document.getElementById('reference-preview-button');
+    const referenceResetButton = document.getElementById('reference-reset-button');
     const cloneFileInput = document.getElementById('clone-file-input');
     const presetsContainer = document.getElementById('presets-container');
     const presetsPlaceholder = document.getElementById('presets-placeholder');
@@ -265,6 +271,8 @@ document.addEventListener('DOMContentLoaded', async function () {
             last_chunk_size: chunkSizeSlider ? parseInt(chunkSizeSlider.value, 10) : 120,
             last_split_text_enabled: splitTextToggle ? splitTextToggle.checked : true,
             last_denoise_enabled: denoiseToggle ? denoiseToggle.checked : false,
+            last_reference_pitch: referencePitchSlider ? parseFloat(referencePitchSlider.value) : 0,
+            last_reference_speed: referenceSpeedSlider ? parseFloat(referenceSpeedSlider.value) : 1,
             hide_chunk_warning: hideChunkWarning,
             hide_generation_warning: hideGenerationWarning,
             theme: localStorage.getItem('uiTheme') || 'dark',
@@ -680,6 +688,10 @@ document.addEventListener('DOMContentLoaded', async function () {
 
         if (denoiseToggle) denoiseToggle.checked = currentUiState.last_denoise_enabled === true;
 
+        if (referencePitchSlider && currentUiState.last_reference_pitch !== undefined) referencePitchSlider.value = currentUiState.last_reference_pitch;
+        if (referenceSpeedSlider && currentUiState.last_reference_speed !== undefined) referenceSpeedSlider.value = currentUiState.last_reference_speed;
+        updateReferenceAdjustmentLabels();
+
         if (chunkSizeSlider && currentUiState.last_chunk_size !== undefined) chunkSizeSlider.value = currentUiState.last_chunk_size;
         if (chunkSizeValue) chunkSizeValue.textContent = chunkSizeSlider ? chunkSizeSlider.value : '120';
         toggleChunkControlsVisibility();
@@ -1079,6 +1091,8 @@ document.addEventListener('DOMContentLoaded', async function () {
             jsonData.predefined_voice_id = predefinedVoiceSelect.value;
         } else if (currentVoiceMode === 'clone' && cloneReferenceSelect.value !== 'none') {
             jsonData.reference_audio_filename = cloneReferenceSelect.value;
+            jsonData.reference_pitch = referencePitchSlider ? parseFloat(referencePitchSlider.value) : 0;
+            jsonData.reference_speed = referenceSpeedSlider ? parseFloat(referenceSpeedSlider.value) : 1;
         }
         return jsonData;
     }
@@ -1454,6 +1468,79 @@ document.addEventListener('DOMContentLoaded', async function () {
 
     if (denoiseToggle) {
         denoiseToggle.addEventListener('change', () => debouncedSaveState());
+    }
+
+    // --- Reference Audio Pitch / Speed ---
+    function updateReferenceAdjustmentLabels() {
+        if (referencePitchSlider && referencePitchValue) {
+            const semitones = parseFloat(referencePitchSlider.value);
+            referencePitchValue.textContent = `${semitones > 0 ? '+' : ''}${semitones} st`;
+        }
+        if (referenceSpeedSlider && referenceSpeedValue) {
+            referenceSpeedValue.textContent = `${parseFloat(referenceSpeedSlider.value).toFixed(2)}x`;
+        }
+    }
+
+    [referencePitchSlider, referenceSpeedSlider].forEach(slider => {
+        if (!slider) return;
+        slider.addEventListener('input', updateReferenceAdjustmentLabels);
+        slider.addEventListener('change', () => debouncedSaveState());
+    });
+    updateReferenceAdjustmentLabels();
+
+    if (referenceResetButton) {
+        referenceResetButton.addEventListener('click', () => {
+            if (referencePitchSlider) referencePitchSlider.value = 0;
+            if (referenceSpeedSlider) referenceSpeedSlider.value = 1;
+            updateReferenceAdjustmentLabels();
+            debouncedSaveState();
+        });
+    }
+
+    let referencePreviewAudio = null;
+    function stopReferencePreview() {
+        if (!referencePreviewAudio) return;
+        referencePreviewAudio.pause();
+        URL.revokeObjectURL(referencePreviewAudio.src);
+        referencePreviewAudio = null;
+    }
+
+    if (referencePreviewButton) {
+        referencePreviewButton.addEventListener('click', async () => {
+            const filename = cloneReferenceSelect ? cloneReferenceSelect.value : 'none';
+            if (!filename || filename === 'none') {
+                showNotification('Select a reference audio file first.', 'warning');
+                return;
+            }
+            // A second click restarts the preview with whatever the sliders now say.
+            stopReferencePreview();
+
+            const originalButtonHTML = referencePreviewButton.innerHTML;
+            referencePreviewButton.disabled = true;
+            referencePreviewButton.textContent = 'Preparing...';
+            try {
+                const params = new URLSearchParams({
+                    filename: filename,
+                    pitch: referencePitchSlider ? referencePitchSlider.value : '0',
+                    speed: referenceSpeedSlider ? referenceSpeedSlider.value : '1'
+                });
+                const response = await fetch(`${API_BASE_URL}/preview_reference?${params.toString()}`);
+                if (!response.ok) {
+                    const errorResult = await response.json().catch(() => ({ detail: `HTTP error ${response.status}` }));
+                    throw new Error(formatErrorDetail(errorResult.detail) || 'Could not prepare the preview.');
+                }
+                const url = URL.createObjectURL(await response.blob());
+                referencePreviewAudio = new Audio(url);
+                referencePreviewAudio.addEventListener('ended', () => URL.revokeObjectURL(url));
+                await referencePreviewAudio.play();
+            } catch (error) {
+                console.error('Error previewing reference audio:', error);
+                showNotification(`Preview failed: ${error.message}`, 'error');
+            } finally {
+                referencePreviewButton.disabled = false;
+                referencePreviewButton.innerHTML = originalButtonHTML;
+            }
+        });
     }
 
     if (predefinedVoiceImportButton && predefinedVoiceFileInput) {

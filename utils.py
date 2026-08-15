@@ -1336,28 +1336,111 @@ def trim_audio_file(
 TRIMMED_CACHE_DIRNAME = ".trimmed"
 
 
-def get_trimmed_reference(
-    source_path: Path, max_duration_sec: float
-) -> Optional[Path]:
+def _render_reference_variant(
+    source_path: Path,
+    destination_path: Path,
+    max_duration_sec: float,
+    pitch_semitones: float,
+    speed_factor: float,
+) -> Tuple[bool, str, float]:
     """
-    Returns a reference audio path guaranteed not to exceed max_duration_sec.
+    Writes a pitch/speed-adjusted, length-capped copy of a reference clip.
 
-    Files that already fit are returned unchanged. Longer ones are trimmed into a
-    cache directory and reused on later requests: a stable path matters because
-    the engine caches voice conditionals by path, and a fresh temp file per
-    request would miss that cache every time. The original file is never modified.
-
-    The cache key covers the source's name, mtime, size and the limit, so
-    replacing a reference file transparently produces a new trimmed copy.
+    Pitch and speed are independent: shifting pitch leaves the timing alone, and
+    changing speed leaves the pitch alone. Both go through librosa's phase
+    vocoder rather than plain resampling, which would drag one along with the
+    other.
 
     Args:
-        source_path: The reference audio file the request asked for.
-        max_duration_sec: Maximum allowed duration in seconds.
+        source_path: Reference audio to transform.
+        destination_path: Where to write the resulting 16-bit WAV.
+        max_duration_sec: Length cap applied after the transform, in seconds.
+        pitch_semitones: Semitones to shift by; 0 leaves pitch alone.
+        speed_factor: Playback rate; >1 is faster, 1.0 leaves timing alone.
 
     Returns:
-        A path to audio within the limit, or None if trimming was needed but
-        failed.
+        A tuple (success: bool, message: str, duration_sec: float).
     """
+    if not LIBROSA_AVAILABLE:
+        return False, "Pitch and speed adjustment need librosa, which is missing.", 0.0
+
+    start_time = time.time()
+    try:
+        # Speeding up consumes more source audio per second of output, so read
+        # exactly as much as the cap can possibly need and no more.
+        needed_input_sec = (
+            max_duration_sec * max(speed_factor, 0.01) if max_duration_sec else None
+        )
+        audio, sample_rate = librosa.load(
+            str(source_path), sr=None, mono=True, duration=needed_input_sec
+        )
+
+        if audio.size == 0:
+            return False, f"No audio could be read from '{source_path.name}'.", 0.0
+
+        if pitch_semitones:
+            audio = librosa.effects.pitch_shift(
+                y=audio, sr=sample_rate, n_steps=float(pitch_semitones)
+            )
+        if speed_factor and speed_factor != 1.0:
+            audio = librosa.effects.time_stretch(y=audio, rate=float(speed_factor))
+
+        if max_duration_sec:
+            audio = audio[: int(max_duration_sec * sample_rate)]
+
+        if not save_audio_to_file(audio, sample_rate, str(destination_path)):
+            return False, "Failed to write the adjusted reference audio.", 0.0
+
+        duration_sec = len(audio) / float(sample_rate)
+        logger.info(
+            f"Rendered reference variant of '{source_path.name}' "
+            f"(pitch {pitch_semitones:+g} st, speed {speed_factor:g}x, "
+            f"{duration_sec:.2f}s) in {time.time() - start_time:.2f}s."
+        )
+        return True, "Reference audio adjusted.", duration_sec
+
+    except Exception as e:
+        logger.error(
+            f"Error adjusting reference '{source_path.name}': {e}", exc_info=True
+        )
+        destination_path.unlink(missing_ok=True)
+        return False, f"Failed to adjust reference audio: {e}", 0.0
+
+
+def prepare_reference_audio(
+    source_path: Path,
+    max_duration_sec: float,
+    pitch_semitones: float = 0.0,
+    speed_factor: float = 1.0,
+) -> Optional[Path]:
+    """
+    Returns the reference audio to hand the model: within the duration limit and
+    with any pitch/speed adjustment already applied.
+
+    A clip that needs nothing done to it is returned unchanged. Otherwise the
+    processed version is cached and reused on later requests: a stable path
+    matters because the engine caches voice conditionals by path, and a fresh
+    temp file per request would miss that cache every time. The original file is
+    never modified.
+
+    Cache names carry two fingerprints - one for the source file (name, mtime,
+    size) and one for the settings (limit, pitch, speed). Editing the source
+    invalidates every variant of it, while switching between settings keeps the
+    variants already rendered.
+
+    Args:
+        source_path: The reference audio the request asked for.
+        max_duration_sec: Maximum allowed duration in seconds.
+        pitch_semitones: Semitones to shift by; 0 for no change.
+        speed_factor: Playback rate; 1.0 for no change.
+
+    Returns:
+        A path to the audio to use, or None if processing was needed but failed.
+    """
+    needs_transform = bool(pitch_semitones) or (
+        speed_factor is not None and speed_factor != 1.0
+    )
+
     duration = get_audio_duration(source_path)
     if duration is None:
         # Unknown length: pass it through rather than block generation.
@@ -1365,50 +1448,65 @@ def get_trimmed_reference(
             f"Could not determine duration of '{source_path.name}'; using it as-is."
         )
         return source_path
-    if duration <= max_duration_sec:
+    if duration <= max_duration_sec and not needs_transform:
         return source_path
 
     try:
         stat = source_path.stat()
-        fingerprint = hashlib.md5(
-            f"{source_path.name}|{stat.st_mtime_ns}|{stat.st_size}|{max_duration_sec}".encode()
-        ).hexdigest()[:12]
+        source_key = hashlib.md5(
+            f"{source_path.name}|{stat.st_mtime_ns}|{stat.st_size}".encode()
+        ).hexdigest()[:8]
+        settings_key = hashlib.md5(
+            f"{max_duration_sec}|{pitch_semitones}|{speed_factor}".encode()
+        ).hexdigest()[:6]
         cache_dir = source_path.parent / TRIMMED_CACHE_DIRNAME
-        cached_path = cache_dir / f"{source_path.stem}_{fingerprint}.wav"
+        cached_path = cache_dir / f"{source_path.stem}_{source_key}_{settings_key}.wav"
 
         if cached_path.is_file() and cached_path.stat().st_size > 0:
-            logger.debug(f"Using cached trimmed reference: {cached_path.name}")
+            logger.debug(f"Using cached reference variant: {cached_path.name}")
             return cached_path
 
         cache_dir.mkdir(parents=True, exist_ok=True)
-        success, message, trimmed_duration = trim_audio_file(
-            source_path, cached_path, max_duration_sec
-        )
+
+        if needs_transform:
+            success, message, result_duration = _render_reference_variant(
+                source_path,
+                cached_path,
+                max_duration_sec,
+                pitch_semitones or 0.0,
+                speed_factor if speed_factor else 1.0,
+            )
+        else:
+            success, message, result_duration = trim_audio_file(
+                source_path, cached_path, max_duration_sec
+            )
+            if success:
+                logger.info(
+                    f"Reference '{source_path.name}' is {duration:.2f}s, over the "
+                    f"{max_duration_sec}s limit; using the first {result_duration:.2f}s."
+                )
+
         if not success:
-            logger.error(f"Could not trim '{source_path.name}': {message}")
+            logger.error(f"Could not prepare '{source_path.name}': {message}")
             return None
 
-        logger.info(
-            f"Reference '{source_path.name}' is {duration:.2f}s, over the "
-            f"{max_duration_sec}s limit; using the first {trimmed_duration:.2f}s."
-        )
-
-        # Drop trimmed copies of this same source made from older versions of the
-        # file. The pattern is anchored on the 12-hex fingerprint so a reference
-        # whose name merely starts with this one's stem is never touched.
+        # Drop variants rendered from an older version of this same file. The
+        # pattern requires a different source fingerprint, so variants of the
+        # current file survive, and a reference whose name merely starts with
+        # this one's stem is never touched.
         stale_pattern = re.compile(
-            rf"^{re.escape(source_path.stem)}_[0-9a-f]{{12}}\.wav$"
+            rf"^{re.escape(source_path.stem)}_(?!{source_key}_)[0-9a-f]{{8}}_[0-9a-f]{{6}}\.wav$"
         )
         for existing in cache_dir.iterdir():
             if existing != cached_path and stale_pattern.match(existing.name):
                 existing.unlink(missing_ok=True)
-                logger.debug(f"Removed stale trimmed reference: {existing.name}")
+                logger.debug(f"Removed stale reference variant: {existing.name}")
 
         return cached_path
 
     except Exception as e:
         logger.error(
-            f"Error preparing trimmed reference for '{source_path.name}': {e}",
+            f"Error preparing reference audio for '{source_path.name}': {e}",
             exc_info=True,
         )
         return None

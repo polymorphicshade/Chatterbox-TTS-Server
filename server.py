@@ -741,6 +741,60 @@ async def get_reference_files_api():
         )
 
 
+@app.get("/preview_reference", tags=["UI Helpers"])
+async def preview_reference_audio_endpoint(
+    filename: str,
+    pitch: float = 0.0,
+    speed: float = 1.0,
+):
+    """
+    Returns the reference audio exactly as the model would receive it: capped to
+    the maximum duration and with the requested pitch/speed applied.
+
+    Backs the UI's "Play Sample" button. Because it goes through the same
+    preparation and cache as generation, previewing a setting also warms the file
+    that the next generation will reuse.
+    """
+    logger.debug(f"Preview request for '{filename}' (pitch={pitch}, speed={speed}).")
+
+    if not -12.0 <= pitch <= 12.0:
+        raise HTTPException(
+            status_code=400, detail="Pitch must be between -12 and +12 semitones."
+        )
+    if not 0.5 <= speed <= 2.0:
+        raise HTTPException(status_code=400, detail="Speed must be between 0.5 and 2.0.")
+
+    ref_dir = get_reference_audio_path(ensure_absolute=True)
+    try:
+        source_path = utils.safe_resolve_within(ref_dir, filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid reference audio filename.")
+
+    if not source_path.is_file():
+        raise HTTPException(
+            status_code=404, detail=f"Reference audio '{filename}' not found."
+        )
+
+    max_dur = config_manager.get_int("audio_output.max_reference_duration_sec", 30)
+    prepared_path = utils.prepare_reference_audio(
+        source_path, max_dur, pitch_semitones=pitch, speed_factor=speed
+    )
+    if prepared_path is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not prepare a preview of '{filename}'.",
+        )
+
+    return FileResponse(
+        path=str(prepared_path),
+        media_type="audio/wav",
+        filename=f"preview_{source_path.stem}.wav",
+        # The cache key already encodes the file and its settings, but the browser
+        # cannot know that, so keep it from replaying a stale preview.
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get(
     "/get_predefined_voices", response_model=List[Dict[str, str]], tags=["UI Helpers"]
 )
@@ -1237,20 +1291,29 @@ async def custom_tts_endpoint(
                 status_code=400, detail=f"Invalid reference audio: {msg}"
             )
 
-        # Covers references that predate upload-time trimming, or that were copied
-        # into the directory by hand. The trimmed copy is cached beside them, so
-        # this costs nothing after the first request for a given file.
+        # Applies the pitch/speed adjustment and the duration cap. The cap also
+        # covers references that predate upload-time trimming, or that were copied
+        # into the directory by hand. Results are cached beside the originals, so
+        # this costs nothing after the first request for a given file and setting.
         max_dur = config_manager.get_int("audio_output.max_reference_duration_sec", 30)
-        trimmed_path = utils.get_trimmed_reference(potential_path, max_dur)
-        if trimmed_path is None:
+        prepared_path = utils.prepare_reference_audio(
+            potential_path,
+            max_dur,
+            pitch_semitones=request.reference_pitch or 0.0,
+            speed_factor=(
+                request.reference_speed if request.reference_speed is not None else 1.0
+            ),
+        )
+        if prepared_path is None:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Reference audio '{request.reference_audio_filename}' is longer than "
-                    f"the {max_dur}s maximum and could not be trimmed."
+                    f"Reference audio '{request.reference_audio_filename}' could not be "
+                    f"prepared (duration cap {max_dur}s, pitch {request.reference_pitch or 0}, "
+                    f"speed {request.reference_speed or 1})."
                 ),
             )
-        audio_prompt_path_for_engine = trimmed_path
+        audio_prompt_path_for_engine = prepared_path
         logger.info(
             f"Using reference audio for cloning: {request.reference_audio_filename}"
         )
@@ -1723,7 +1786,7 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
 
     # The model's reference limit applies whichever directory the voice came from.
     max_dur = config_manager.get_int("audio_output.max_reference_duration_sec", 30)
-    trimmed_prompt_path = utils.get_trimmed_reference(audio_prompt_path, max_dur)
+    trimmed_prompt_path = utils.prepare_reference_audio(audio_prompt_path, max_dur)
     if trimmed_prompt_path is None:
         raise HTTPException(
             status_code=400,

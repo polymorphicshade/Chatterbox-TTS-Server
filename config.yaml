@@ -60,6 +60,8 @@ ui_state:
   last_chunk_size: 240
   last_split_text_enabled: true
   last_denoise_enabled: false
+  last_reference_pitch: 0.0
+  last_reference_speed: 1.0
   hide_chunk_warning: false
   hide_generation_warning: false
   theme: light
