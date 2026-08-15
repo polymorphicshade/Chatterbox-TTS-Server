@@ -89,6 +89,7 @@ document.addEventListener('DOMContentLoaded', async function () {
     const cloneReferenceSelect = document.getElementById('clone-reference-select');
     const cloneImportButton = document.getElementById('clone-import-button');
     const cloneRefreshButton = document.getElementById('clone-refresh-button');
+    const denoiseToggle = document.getElementById('denoise-toggle');
     const cloneFileInput = document.getElementById('clone-file-input');
     const presetsContainer = document.getElementById('presets-container');
     const presetsPlaceholder = document.getElementById('presets-placeholder');
@@ -263,6 +264,7 @@ document.addEventListener('DOMContentLoaded', async function () {
             last_seed: seedInput ? parseInt(seedInput.value, 10) || 0 : 0,
             last_chunk_size: chunkSizeSlider ? parseInt(chunkSizeSlider.value, 10) : 120,
             last_split_text_enabled: splitTextToggle ? splitTextToggle.checked : true,
+            last_denoise_enabled: denoiseToggle ? denoiseToggle.checked : false,
             hide_chunk_warning: hideChunkWarning,
             hide_generation_warning: hideGenerationWarning,
             theme: localStorage.getItem('uiTheme') || 'dark',
@@ -675,6 +677,8 @@ document.addEventListener('DOMContentLoaded', async function () {
         else if (seedInput && currentConfig?.generation_defaults?.seed !== undefined) seedInput.value = currentConfig.generation_defaults.seed;
 
         if (splitTextToggle) splitTextToggle.checked = currentUiState.last_split_text_enabled !== undefined ? currentUiState.last_split_text_enabled : true;
+
+        if (denoiseToggle) denoiseToggle.checked = currentUiState.last_denoise_enabled === true;
 
         if (chunkSizeSlider && currentUiState.last_chunk_size !== undefined) chunkSizeSlider.value = currentUiState.last_chunk_size;
         if (chunkSizeValue) chunkSizeValue.textContent = chunkSizeSlider ? chunkSizeSlider.value : '120';
@@ -1377,7 +1381,7 @@ document.addEventListener('DOMContentLoaded', async function () {
     }
 
     // --- File Upload & Refresh ---
-    async function handleFileUpload(fileInput, endpoint, successCallback, buttonToAnimate) {
+    async function handleFileUpload(fileInput, endpoint, successCallback, buttonToAnimate, extraFields = {}) {
         const files = fileInput.files;
         if (!files || files.length === 0) return;
         const originalButtonHTML = buttonToAnimate ? buttonToAnimate.innerHTML : '';
@@ -1385,9 +1389,13 @@ document.addEventListener('DOMContentLoaded', async function () {
             buttonToAnimate.innerHTML = `<svg class="animate-spin h-5 w-5 mr-1.5 inline-block" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>Uploading...`;
             buttonToAnimate.disabled = true;
         }
-        const uploadNotification = showNotification(`Uploading ${files.length} file(s)...`, 'info', 0);
+        // De-noising runs a model on the server and is not instant, so say so
+        // rather than leaving a plain "Uploading..." on screen for several seconds.
+        const uploadVerb = extraFields.denoise === 'true' ? 'Uploading and de-noising' : 'Uploading';
+        const uploadNotification = showNotification(`${uploadVerb} ${files.length} file(s)...`, 'info', 0);
         const formData = new FormData();
         for (const file of files) formData.append('files', file);
+        for (const [key, value] of Object.entries(extraFields)) formData.append(key, value);
         try {
             const response = await fetch(`${API_BASE_URL}${endpoint}`, {
                 method: 'POST',
@@ -1403,6 +1411,9 @@ document.addEventListener('DOMContentLoaded', async function () {
                 result.warnings.forEach(w => showNotification(`${w.filename || 'File'}: ${w.warning}`, 'warning', 12000));
             }
             const successfulUploads = result.uploaded_files || [];
+            if (result.denoised) {
+                showNotification('Background noise removed with DeepFilterNet.', 'info', 6000);
+            }
             if (result.combined_file) {
                 const sources = result.combined_from || [];
                 showNotification(`Chained ${sources.length} short clips into ${result.combined_file}`, 'success', 8000);
@@ -1437,7 +1448,11 @@ document.addEventListener('DOMContentLoaded', async function () {
             if (fileToSelect && cloneReferenceSelect && Array.from(cloneReferenceSelect.options).some(opt => opt.value === fileToSelect)) {
                 cloneReferenceSelect.value = fileToSelect;
             }
-        }, cloneImportButton));
+        }, cloneImportButton, { denoise: denoiseToggle && denoiseToggle.checked ? 'true' : 'false' }));
+    }
+
+    if (denoiseToggle) {
+        denoiseToggle.addEventListener('change', () => debouncedSaveState());
     }
 
     if (predefinedVoiceImportButton && predefinedVoiceFileInput) {

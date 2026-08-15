@@ -58,6 +58,7 @@ ui_state:
   last_seed: 3000
   last_chunk_size: 240
   last_split_text_enabled: true
+  last_denoise_enabled: false
   hide_chunk_warning: false
   hide_generation_warning: false
   theme: light

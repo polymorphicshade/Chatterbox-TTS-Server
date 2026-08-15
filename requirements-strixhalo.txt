@@ -27,4 +27,5 @@ tqdm
 pydub
 praat-parselmouth # For unvoiced segment removal
 librosa # for changes to sampling
+deepfilternet>=0.5.6  # AI background-noise removal for reference audio uploads
 hf-transfer

@@ -4,6 +4,7 @@
 # file system operations, and performance monitoring.
 
 import os
+import importlib.util
 import logging
 import re
 import time
@@ -53,6 +54,18 @@ except ImportError:
     PARSELMOUTH_AVAILABLE = False
     logger.warning(
         "Parselmouth library not found. Unvoiced segment removal feature will be disabled."
+    )
+
+# DeepFilterNet powers the De-noise option on reference audio uploads. Presence is
+# probed cheaply here; the real (expensive) import happens on first use, so a
+# server that never denoises never pays for it.
+DEEPFILTERNET_AVAILABLE = importlib.util.find_spec("df") is not None
+if DEEPFILTERNET_AVAILABLE:
+    logger.info("DeepFilterNet found and will be used for reference audio denoising.")
+else:
+    logger.warning(
+        "DeepFilterNet not found. The De-noise option on reference audio uploads "
+        "will be unavailable until 'pip install deepfilternet' is run."
     )
 
 
@@ -1244,6 +1257,77 @@ def validate_reference_audio(
                 f"Skipping duration check for this file."
             )
     return True, "Reference audio appears valid."
+
+
+# --- Reference Audio Denoising ---
+# init_df() builds the model and loads weights, which is slow and downloads on
+# first use; keep the result for the life of the process.
+_df_model = None
+_df_state = None
+
+
+def _get_deepfilternet():
+    """Lazily initialises and caches the DeepFilterNet model and state."""
+    global _df_model, _df_state
+    if _df_model is None:
+        from df.enhance import init_df
+
+        logger.info("Initialising DeepFilterNet (first use may download weights)...")
+        _df_model, _df_state, _ = init_df()
+        logger.info(f"DeepFilterNet ready at {_df_state.sr()}Hz.")
+    return _df_model, _df_state
+
+
+def denoise_audio_file(source_path: Path, destination_path: Path) -> Tuple[bool, str]:
+    """
+    Removes background noise from a speech recording using DeepFilterNet,
+    writing a 16-bit WAV result.
+
+    Args:
+        source_path: Audio file to clean up (.wav or .mp3).
+        destination_path: Where to write the denoised WAV. The audio is fully in
+            memory before anything is written, so this may equal source_path.
+
+    Returns:
+        A tuple (success: bool, message: str). On failure the destination is left
+        untouched and the caller should keep the original file.
+    """
+    if not DEEPFILTERNET_AVAILABLE:
+        return (
+            False,
+            "De-noising needs DeepFilterNet. Run 'pip install deepfilternet' and "
+            "restart the server.",
+        )
+
+    if not source_path.exists():
+        return False, f"File not found for denoising: {source_path.name}"
+
+    start_time = time.time()
+    try:
+        from df.enhance import enhance
+
+        model, df_state = _get_deepfilternet()
+
+        # Loading and writing happen here rather than through df's own
+        # load_audio/save_audio helpers: it keeps the dependency surface down to
+        # init_df() and enhance(), and guarantees a 16-bit PCM result. A float32
+        # WAV would be unreadable by pydub when clips are chained afterwards.
+        audio_np, _sr = librosa.load(str(source_path), sr=df_state.sr(), mono=True)
+        enhanced = enhance(model, df_state, torch.from_numpy(audio_np).unsqueeze(0))
+        enhanced_np = enhanced.squeeze(0).detach().cpu().numpy()
+
+        if not save_audio_to_file(enhanced_np, df_state.sr(), str(destination_path)):
+            raise RuntimeError("Failed to write denoised audio.")
+
+        logger.info(
+            f"Denoised '{source_path.name}' with DeepFilterNet in "
+            f"{time.time() - start_time:.2f}s."
+        )
+        return True, "Denoised with DeepFilterNet."
+
+    except Exception as e:
+        logger.error(f"DeepFilterNet failed on '{source_path.name}': {e}", exc_info=True)
+        return False, f"De-noising failed: {e}"
 
 
 def get_audio_duration(file_path: Path) -> Optional[float]:

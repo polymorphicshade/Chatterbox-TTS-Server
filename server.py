@@ -669,7 +669,9 @@ async def get_predefined_voices_api():
 
 # --- File Upload Endpoints ---
 @app.post("/upload_reference", tags=["File Management"])
-async def upload_reference_audio_endpoint(files: List[UploadFile] = File(...)):
+async def upload_reference_audio_endpoint(
+    files: List[UploadFile] = File(...), denoise: bool = Form(False)
+):
     """
     Handles uploading of reference audio files (.wav, .mp3) for voice cloning.
     Validates files and saves them to the configured reference audio path.
@@ -680,10 +682,16 @@ async def upload_reference_audio_endpoint(files: List[UploadFile] = File(...)):
     'audio_output.reference_combine_gap_ms' of silence. Files that already meet
     the minimum are saved individually, exactly as before.
 
+    When 'denoise' is set, background noise is stripped from each clip with
+    DeepFilterNet before any chaining happens, so every clip is cleaned against
+    its own noise profile.
+
     Uploads are staged in a temporary directory first, so a batch that gets
     combined leaves only the combined file behind rather than its parts.
     """
-    logger.info(f"Request to /upload_reference with {len(files)} file(s).")
+    logger.info(
+        f"Request to /upload_reference with {len(files)} file(s). denoise={denoise}"
+    )
     ref_path = get_reference_audio_path(ensure_absolute=True)
     max_duration = config_manager.get_int("audio_output.max_reference_duration_sec", 30)
     min_duration = config_manager.get_float(
@@ -696,6 +704,8 @@ async def upload_reference_audio_endpoint(files: List[UploadFile] = File(...)):
     upload_warnings: List[Dict[str, str]] = []
     combined_filename: Optional[str] = None
     combined_sources: List[str] = []
+    denoised_any = False
+    denoise_failure_reported = False
 
     # (safe_filename, staged_path, duration_sec_or_None)
     staged_files: List[tuple] = []
@@ -745,6 +755,29 @@ async def upload_reference_audio_endpoint(files: List[UploadFile] = File(...)):
                         {"filename": safe_filename, "error": validation_msg}
                     )
                     continue
+
+                # Denoise before measuring and chaining, so each clip is cleaned
+                # against its own noise profile and the duration recorded below
+                # is the one the saved file actually has.
+                if denoise:
+                    denoised_path = staged_path.with_name(
+                        f"{staged_path.stem}_denoised.wav"
+                    )
+                    ok, denoise_msg = utils.denoise_audio_file(
+                        staged_path, denoised_path
+                    )
+                    if ok:
+                        staged_path = denoised_path
+                        # Denoising always writes WAV, so an MP3 input changes
+                        # extension; keep the stored name in step with the file.
+                        safe_filename = f"{Path(safe_filename).stem}.wav"
+                        denoised_any = True
+                    elif not denoise_failure_reported:
+                        # One notice per request, not one per file.
+                        denoise_failure_reported = True
+                        upload_warnings.append(
+                            {"filename": safe_filename, "warning": denoise_msg}
+                        )
 
                 duration = utils.get_audio_duration(staged_path)
                 staged_files.append((safe_filename, staged_path, duration))
@@ -860,6 +893,7 @@ async def upload_reference_audio_endpoint(files: List[UploadFile] = File(...)):
         "all_reference_files": all_current_reference_files,
         "combined_file": combined_filename,
         "combined_from": combined_sources,
+        "denoised": denoised_any,
         "errors": upload_errors,
         "warnings": upload_warnings,
     }
