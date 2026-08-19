@@ -40,8 +40,8 @@ class GenerationParams(BaseModel):
     volume: Optional[float] = Field(
         None,
         ge=0.0,
-        le=2.0,
-        description="Output volume of the generated audio. 1.0 is unchanged, 2.0 is double amplitude. Applied post-generation.",
+        le=5.0,
+        description="Output volume of the generated audio. 1.0 is unchanged, 2.0 is double amplitude. Peaks are soft-limited, so gains well above unity compress rather than clip. Applied post-generation.",
     )
     language: Optional[str] = Field(
         None,
@@ -111,7 +111,7 @@ class CustomTTSRequest(BaseModel):
     volume: Optional[float] = Field(
         None,
         ge=0.0,
-        le=2.0,
+        le=5.0,
         description="Overrides default output volume if provided. 1.0 is unchanged, 2.0 is double amplitude.",
     )
     language: Optional[str] = Field(

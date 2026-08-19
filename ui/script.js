@@ -331,7 +331,10 @@ document.addEventListener('DOMContentLoaded', async function () {
         const percent = parseInt(volumeSlider.value, 10);
         if (volumeValueDisplay) volumeValueDisplay.textContent = `${percent}%`;
         if (volumeWarningSpan) {
-            if (percent > 100) {
+            if (percent > 200) {
+                volumeWarningSpan.textContent = "* Heavy limiting at this gain; dynamics will flatten.";
+                volumeWarningSpan.classList.remove('hidden');
+            } else if (percent > 100) {
                 volumeWarningSpan.textContent = "* Peaks are soft-limited above 100%.";
                 volumeWarningSpan.classList.remove('hidden');
             } else {
