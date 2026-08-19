@@ -101,6 +101,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "last_denoise_enabled": False,  # Whether reference audio de-noising was last enabled in UI.
         "last_reference_pitch": 0.0,  # Semitones of pitch shift last applied to the reference audio.
         "last_reference_speed": 1.0,  # Speed factor last applied to the reference audio.
+        "tips_expanded": True,  # Whether the Tips & Tricks panel is left open.
         "hide_chunk_warning": False,  # Flag to hide the chunking warning modal.
         "hide_generation_warning": False,  # Flag to hide the general generation quality notice modal.
         "theme": "dark",  # Default UI theme ('dark' or 'light').

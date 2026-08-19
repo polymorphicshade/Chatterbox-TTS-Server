@@ -530,30 +530,39 @@
                 <div id="audio-player-container" class="mt-4"></div>
 
                 <div class="mt-10">
-                    <h2 class="card__title mb-4">Tips & Tricks</h2>
-                    <div class="card">
-                        <div class="card__body">
-                            <ul class="tips-list">
-                                <li>For <strong>Audiobooks</strong>, use <strong>MP3</strong> format, enable
-                                    <strong>Split text</strong>, and set a chunk size of ~250-500.
-                                </li>
-                                <li>Use <strong>Predefined Voices</strong> for consistent, high-quality output. You can
-                                    import new ones.</li>
-                                <li>For <strong>Voice Cloning</strong>, upload clean reference audio (<code
-                                        class="code">.wav</code>/<code class="code">.mp3</code>). Quality of reference
-                                    is key.</li>
-                                <li>Experiment with <strong>Temperature</strong> and other generation parameters to
-                                    fine-tune output.</li>
-                                <li>Adjusting <strong>Speed Factor</strong> away from 1.0 is experimental and may cause
-                                    echo.</li>
-                                <li>When using <strong>Turbo</strong> model, you can insert paralinguistic tags like
-                                    <code class="code">[laugh]</code> or <code class="code">[sigh]</code> for natural
-                                    vocal reactions.
-                                </li>
-                                <li>Check the <code class="code">/docs</code> endpoint for API details.</li>
-                            </ul>
+                    <details id="tips-collapsible" class="collapsible" open>
+                        <summary class="collapsible__trigger tips-collapsible__trigger mb-4">
+                            <h2 class="card__title">Tips & Tricks</h2>
+                            <svg class="collapsible__icon" viewBox="0 0 20 20" fill="currentColor">
+                                <path fill-rule="evenodd"
+                                    d="M5.293 7.293a1 1 0 011.414 0L10 10.586l3.293-3.293a1 1 0 111.414 1.414l-4 4a1 1 0 01-1.414 0l-4-4a1 1 0 010-1.414z"
+                                    clip-rule="evenodd" />
+                            </svg>
+                        </summary>
+                        <div class="card">
+                            <div class="card__body">
+                                <ul class="tips-list">
+                                    <li>For <strong>Audiobooks</strong>, use <strong>MP3</strong> format, enable
+                                        <strong>Split text</strong>, and set a chunk size of ~250-500.
+                                    </li>
+                                    <li>Use <strong>Predefined Voices</strong> for consistent, high-quality output. You can
+                                        import new ones.</li>
+                                    <li>For <strong>Voice Cloning</strong>, upload clean reference audio (<code
+                                            class="code">.wav</code>/<code class="code">.mp3</code>). Quality of reference
+                                        is key.</li>
+                                    <li>Experiment with <strong>Temperature</strong> and other generation parameters to
+                                        fine-tune output.</li>
+                                    <li>Adjusting <strong>Speed Factor</strong> away from 1.0 is experimental and may cause
+                                        echo.</li>
+                                    <li>When using <strong>Turbo</strong> model, you can insert paralinguistic tags like
+                                        <code class="code">[laugh]</code> or <code class="code">[sigh]</code> for natural
+                                        vocal reactions.
+                                    </li>
+                                    <li>Check the <code class="code">/docs</code> endpoint for API details.</li>
+                                </ul>
+                            </div>
                         </div>
-                    </div>
+                    </details>
                 </div>
             </div>
         </main>

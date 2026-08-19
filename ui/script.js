@@ -126,6 +126,7 @@ document.addEventListener('DOMContentLoaded', async function () {
     const configStatus = document.getElementById('config-status');
     const resetSettingsBtn = document.getElementById('reset-settings-btn');
     const audioPlayerContainer = document.getElementById('audio-player-container');
+    const tipsCollapsible = document.getElementById('tips-collapsible');
     const loadingOverlay = document.getElementById('loading-overlay');
     const loadingMessage = document.getElementById('loading-message');
     const loadingStatusText = document.getElementById('loading-status');
@@ -279,6 +280,7 @@ document.addEventListener('DOMContentLoaded', async function () {
             last_denoise_enabled: denoiseToggle ? denoiseToggle.checked : false,
             last_reference_pitch: referencePitchSlider ? parseFloat(referencePitchSlider.value) : 0,
             last_reference_speed: referenceSpeedSlider ? parseFloat(referenceSpeedSlider.value) : 1,
+            tips_expanded: tipsCollapsible ? tipsCollapsible.open : true,
             hide_chunk_warning: hideChunkWarning,
             hide_generation_warning: hideGenerationWarning,
             theme: localStorage.getItem('uiTheme') || 'dark',
@@ -737,6 +739,8 @@ document.addEventListener('DOMContentLoaded', async function () {
         if (languageSelect) languageSelect.value = genDefaults.language || 'en';
         if (outputFormatSelect) outputFormatSelect.value = currentConfig?.audio_output?.format || 'mp3';
 
+        if (tipsCollapsible) tipsCollapsible.open = currentUiState.tips_expanded !== false;
+
         if (hideChunkWarningCheckbox) hideChunkWarningCheckbox.checked = hideChunkWarning;
         if (hideGenerationWarningCheckbox) hideGenerationWarningCheckbox.checked = hideGenerationWarning;
 
@@ -798,6 +802,7 @@ document.addEventListener('DOMContentLoaded', async function () {
             volumeSlider.addEventListener('input', updateVolumeLabel);
             volumeSlider.addEventListener('change', debouncedSaveState);
         }
+        if (tipsCollapsible) tipsCollapsible.addEventListener('toggle', debouncedSaveState);
         if (languageSelect) languageSelect.addEventListener('change', debouncedSaveState);
         if (outputFormatSelect) outputFormatSelect.addEventListener('change', debouncedSaveState);
 

@@ -1519,6 +1519,13 @@ a.btn.disabled {
     transform: rotate(180deg);
 }
 
+/* The Tips & Tricks heading doubles as its own disclosure trigger. The h2 keeps
+   its section-heading weight, but its bottom margin has to come off or it drags
+   the chevron out of line with the text in the flex row. */
+.tips-collapsible__trigger .card__title {
+    margin-bottom: 0;
+}
+
 .collapsible__content {
     margin-top: var(--space-4);
     padding-top: var(--space-5);
