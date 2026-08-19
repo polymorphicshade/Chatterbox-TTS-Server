@@ -1,7 +1,7 @@
 # File: models.py
 # Pydantic models for API request and response validation.
 
-from typing import Optional, Literal
+from typing import Dict, List, Optional, Literal
 from pydantic import BaseModel, Field
 
 
@@ -122,6 +122,55 @@ class CustomTTSRequest(BaseModel):
         False,
         description="If true, returns a StreamingResponse with WAV audio yielded as each chunk is synthesized. output_format is ignored when streaming.",
     )
+
+
+class ChatMessage(BaseModel):
+    """One turn of the Chat tab's conversation."""
+
+    role: Literal["user", "assistant"] = Field(
+        ..., description="Who wrote the message. The system message is supplied by the server from config."
+    )
+    content: str = Field(..., description="The message text.")
+
+
+class ChatCompletionRequest(BaseModel):
+    """Request model for the /api/chat/completions proxy."""
+
+    messages: List[ChatMessage] = Field(
+        ...,
+        min_length=1,
+        description="Conversation so far, oldest first. The newest entry is the message being answered.",
+    )
+
+
+class ChatEmotionRequest(BaseModel):
+    """Request model for /api/chat/emotion, which labels how a reply should be spoken."""
+
+    text: str = Field(
+        ..., min_length=1, description="The reply that is about to be spoken."
+    )
+    context: List[ChatMessage] = Field(
+        default_factory=list,
+        description="Recent conversation leading up to the reply, oldest first. Used as context for the labelling.",
+    )
+
+
+class ChatEmotionResponse(BaseModel):
+    """The emotion preset chosen for a reply."""
+
+    emotion: str = Field(
+        ..., description="Name of the matched preset from ui/emotion_presets.yaml."
+    )
+    params: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Generation parameters of that preset, to layer over the General tab's settings.",
+    )
+
+
+class ChatTranscriptionResponse(BaseModel):
+    """Text recognised from a recorded voice message."""
+
+    text: str = Field(..., description="The transcribed text. May be empty if nothing was recognised.")
 
 
 class ErrorResponse(BaseModel):

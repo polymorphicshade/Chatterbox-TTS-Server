@@ -90,6 +90,32 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "reference_combine_gap_ms": 3000,  # Silence inserted between chained reference clips, in ms.
         "save_to_disk": False,  # If true, save generated audio files to disk in outputs folder.
     },
+    "chat": {  # OpenAI-compatible chat endpoint powering the UI's Chat tab.
+        # Base URL of the endpoint, including the version path. Anything that
+        # speaks the OpenAI API works here: OpenAI itself, Ollama, llama.cpp,
+        # LM Studio, vLLM, OpenRouter, a local proxy.
+        "base_url": "http://localhost:11434/v1",
+        "api_key": "",  # Sent as a Bearer token. Leave blank for local servers that do not check it.
+        "model": "",  # Model id to chat with, e.g. 'gpt-4o-mini' or 'llama3.1:8b'.
+        "system_message": (
+            "You are a friendly conversational companion. Your replies are read "
+            "aloud by a text-to-speech voice, so keep them short - two or three "
+            "sentences - and write them the way a person would say them out loud. "
+            "Do not use markdown, bullet lists, emoji or code blocks."
+        ),
+        "temperature": 0.8,  # Sampling temperature for the chat model (not the TTS temperature).
+        "max_tokens": 512,  # Upper bound on reply length. 0 leaves it to the endpoint.
+        "history_turns": 12,  # How many previous messages are resent as context. 0 sends none.
+        "request_timeout_sec": 120,  # How long to wait on the endpoint before giving up.
+        "auto_play": True,  # Speak each reply as it arrives.
+        # 'general' reuses the voice settings from the General tab as-is.
+        # 'auto' asks the LLM which emotion the reply should be delivered with
+        # and applies the matching preset from ui/emotion_presets.yaml on top.
+        "emotion_mode": "general",
+        "emotion_model": "",  # Model used for that classification. Blank means the chat model.
+        "stt_base_url": "",  # Endpoint for voice input transcription. Blank means the chat base_url.
+        "stt_model": "whisper-1",  # Transcription model id.
+    },
     "ui_state": {  # Stores user interface preferences and last-used values.
         "last_text": "",  # Last text entered by the user.
         "last_voice_mode": "predefined",  # Last selected voice mode ('predefined' or 'clone').
@@ -105,6 +131,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "hide_chunk_warning": False,  # Flag to hide the chunking warning modal.
         "hide_generation_warning": False,  # Flag to hide the general generation quality notice modal.
         "theme": "dark",  # Default UI theme ('dark' or 'light').
+        "last_active_tab": "general",  # Which top-level tab was open ('general' or 'chat').
     },
     "ui": {  # General UI display settings.
         "title": "Chatterbox TTS Server",  # Title displayed in the web UI.
@@ -913,6 +940,24 @@ def get_audio_sample_rate() -> int:
         "audio_output.sample_rate",
         _get_default_from_structure("audio_output.sample_rate"),
     )
+
+
+# Chat Settings Accessors
+def get_chat_config() -> Dict[str, Any]:
+    """
+    Returns the Chat tab's settings, with any key missing from config.yaml
+    filled in from the defaults.
+
+    The section is written by the UI rather than by hand, so an older
+    config.yaml can easily be missing keys added since it was written. Merging
+    over the defaults here means callers can index the result without guarding
+    every key.
+    """
+    defaults = deepcopy(_get_default_from_structure("chat"))
+    current = config_manager.get("chat", {})
+    if isinstance(current, dict):
+        defaults.update({k: v for k, v in current.items() if v is not None})
+    return defaults
 
 
 # UI State Accessors

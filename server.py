@@ -6,6 +6,8 @@
 import os
 import io
 import asyncio
+import json
+import re
 import struct
 import logging
 import logging.handlers  # For RotatingFileHandler
@@ -14,6 +16,7 @@ import tempfile
 import time
 import uuid
 import yaml  # For loading presets
+import requests  # For talking to the user's OpenAI-compatible chat endpoint
 import numpy as np
 import librosa  # For potential direct use if needed, though utils.py handles most
 from pathlib import Path
@@ -62,6 +65,7 @@ from config import (
     get_audio_sample_rate,
     get_full_config_for_template,
     get_audio_output_format,
+    get_chat_config,
 )
 
 import engine  # TTS Engine interface
@@ -69,6 +73,10 @@ from models import (  # Pydantic models
     CustomTTSRequest,
     ErrorResponse,
     UpdateStatusResponse,
+    ChatCompletionRequest,
+    ChatEmotionRequest,
+    ChatEmotionResponse,
+    ChatTranscriptionResponse,
 )
 import utils  # Utility functions
 
@@ -2009,6 +2017,505 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
     except Exception as e:
         logger.error(f"Error in openai_speech_endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Chat Tab - OpenAI-Compatible Endpoint Proxy
+# ============================================================================
+# The Chat tab talks to whatever OpenAI-compatible endpoint the user configures
+# (OpenAI, Ollama, llama.cpp, LM Studio, vLLM, ...). The browser goes through
+# these routes rather than calling that endpoint directly, for two reasons: a
+# local model server almost never sends the CORS headers that would let a page
+# on this origin call it, and routing through here keeps the API key on the
+# server side of the wire instead of in every request the page makes.
+
+
+def _chat_url(base_url: str, path: str) -> str:
+    """
+    Joins a configured base URL with an API path.
+
+    The base URL is taken literally: it is the user's own endpoint and only they
+    know whether it needs a '/v1' on the end, so nothing is guessed or appended
+    beyond the path itself.
+    """
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        raise HTTPException(
+            status_code=400,
+            detail="No chat endpoint is configured. Set the endpoint URL in the Chat tab's settings.",
+        )
+    if not base.lower().startswith(("http://", "https://")):
+        raise HTTPException(
+            status_code=400,
+            detail=f"The chat endpoint URL must start with http:// or https:// (got '{base}').",
+        )
+    return f"{base}{path}"
+
+
+def _chat_headers(api_key: str, json_body: bool = True) -> Dict[str, str]:
+    """Builds request headers for the chat endpoint. Never log the result."""
+    headers: Dict[str, str] = {}
+    key = (api_key or "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def _chat_timeouts(cfg: Dict[str, Any]) -> tuple:
+    """Returns a (connect, read) timeout pair for requests."""
+    try:
+        read_timeout = float(cfg.get("request_timeout_sec") or 120)
+    except (TypeError, ValueError):
+        read_timeout = 120.0
+    return (10.0, max(5.0, read_timeout))
+
+
+def _upstream_error(response: requests.Response) -> str:
+    """
+    Turns an error response from the chat endpoint into something readable.
+
+    OpenAI-compatible servers put the useful part in different places, so this
+    tries the common shapes and falls back to the raw body, trimmed.
+    """
+    detail = ""
+    try:
+        body = response.json()
+        if isinstance(body, dict):
+            error = body.get("error")
+            if isinstance(error, dict):
+                detail = str(error.get("message") or "")
+            elif isinstance(error, str):
+                detail = error
+            if not detail:
+                detail = str(body.get("message") or body.get("detail") or "")
+    except ValueError:
+        detail = ""
+    if not detail:
+        detail = (response.text or "").strip()[:500]
+    return f"Chat endpoint returned {response.status_code}" + (
+        f": {detail}" if detail else "."
+    )
+
+
+def _trimmed_history(
+    messages: List[Any], history_turns: Any, system_message: str
+) -> List[Dict[str, str]]:
+    """
+    Builds the message list to send upstream: the system message, then the most
+    recent `history_turns` messages. The newest message is always kept, however
+    small the limit, since that is the one being answered.
+    """
+    payload_messages: List[Dict[str, str]] = []
+    instruction = (system_message or "").strip()
+    if instruction:
+        payload_messages.append({"role": "system", "content": instruction})
+
+    try:
+        limit = int(history_turns)
+    except (TypeError, ValueError):
+        limit = 12
+    kept = messages[-limit:] if limit > 0 else messages[-1:]
+    for message in kept:
+        payload_messages.append({"role": message.role, "content": message.content})
+    return payload_messages
+
+
+def _chat_completion_payload(
+    cfg: Dict[str, Any],
+    messages: List[Dict[str, str]],
+    stream: bool,
+    model: Optional[str] = None,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Assembles a /chat/completions request body from the saved chat settings."""
+    chosen_model = (model or cfg.get("model") or "").strip()
+    if not chosen_model:
+        raise HTTPException(
+            status_code=400,
+            detail="No chat model is configured. Set the model in the Chat tab's settings.",
+        )
+
+    payload: Dict[str, Any] = {
+        "model": chosen_model,
+        "messages": messages,
+        "stream": stream,
+    }
+
+    effective_temperature = (
+        temperature if temperature is not None else cfg.get("temperature")
+    )
+    if effective_temperature is not None:
+        try:
+            payload["temperature"] = float(effective_temperature)
+        except (TypeError, ValueError):
+            pass
+
+    effective_max_tokens = (
+        max_tokens if max_tokens is not None else cfg.get("max_tokens")
+    )
+    try:
+        effective_max_tokens = int(effective_max_tokens or 0)
+    except (TypeError, ValueError):
+        effective_max_tokens = 0
+    if effective_max_tokens > 0:
+        payload["max_tokens"] = effective_max_tokens
+
+    return payload
+
+
+def _completion_text(chunk: Dict[str, Any]) -> str:
+    """Pulls the text out of one chat completion chunk or whole response."""
+    choices = chunk.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    choice = choices[0] or {}
+    delta = choice.get("delta")
+    if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+        return delta["content"]
+    # Non-streamed responses, and the final chunk from some servers, carry a
+    # whole message instead of a delta.
+    message = choice.get("message")
+    if isinstance(message, dict) and isinstance(message.get("content"), str):
+        return message["content"]
+    if isinstance(choice.get("text"), str):
+        return choice["text"]
+    return ""
+
+
+def _ndjson(record: Dict[str, Any]) -> bytes:
+    """Encodes one newline-delimited JSON record for the browser to read."""
+    return (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _request_chat_completion(cfg: Dict[str, Any], payload: Dict[str, Any]) -> str:
+    """
+    Runs a non-streaming completion and returns the reply text.
+
+    Used for the short internal calls (emotion labelling), where streaming would
+    only get in the way.
+    """
+    url = _chat_url(cfg.get("base_url", ""), "/chat/completions")
+    try:
+        response = requests.post(
+            url,
+            headers=_chat_headers(cfg.get("api_key", "")),
+            json=payload,
+            timeout=_chat_timeouts(cfg),
+        )
+    except requests.RequestException as e:
+        raise HTTPException(
+            status_code=502, detail=f"Could not reach the chat endpoint: {e}"
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=_upstream_error(response))
+
+    try:
+        body = response.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=502,
+            detail="The chat endpoint returned a response that was not JSON.",
+        )
+    return _completion_text(body if isinstance(body, dict) else {}).strip()
+
+
+@app.get("/api/chat/models", tags=["Chat"])
+def chat_models_endpoint():
+    """Lists the model ids the configured chat endpoint reports."""
+    cfg = get_chat_config()
+    url = _chat_url(cfg.get("base_url", ""), "/models")
+    try:
+        response = requests.get(
+            url,
+            headers=_chat_headers(cfg.get("api_key", ""), json_body=False),
+            timeout=_chat_timeouts(cfg),
+        )
+    except requests.RequestException as e:
+        raise HTTPException(
+            status_code=502, detail=f"Could not reach the chat endpoint: {e}"
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=_upstream_error(response))
+
+    try:
+        body = response.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=502, detail="The chat endpoint's model list was not valid JSON."
+        )
+
+    entries = body.get("data") if isinstance(body, dict) else body
+    model_ids: List[str] = []
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict):
+                model_id = entry.get("id") or entry.get("name")
+                if model_id:
+                    model_ids.append(str(model_id))
+            elif isinstance(entry, str):
+                model_ids.append(entry)
+    logger.info(f"Chat endpoint reported {len(model_ids)} model(s).")
+    return {"models": sorted(model_ids)}
+
+
+@app.post("/api/chat/completions", tags=["Chat"])
+def chat_completions_endpoint(request: ChatCompletionRequest):
+    """
+    Streams a reply from the configured chat endpoint.
+
+    The response is newline-delimited JSON rather than raw text so that a failure
+    part-way through a reply can still be reported to the page: every line is one
+    of {"delta": "..."}, {"error": "..."} or {"done": true}.
+    """
+    cfg = get_chat_config()
+    messages = _trimmed_history(
+        request.messages,
+        cfg.get("history_turns", 12),
+        cfg.get("system_message", ""),
+    )
+    payload = _chat_completion_payload(cfg, messages, stream=True)
+    url = _chat_url(cfg.get("base_url", ""), "/chat/completions")
+    headers = _chat_headers(cfg.get("api_key", ""))
+    timeouts = _chat_timeouts(cfg)
+    logger.info(
+        f"Chat request: model='{payload['model']}', {len(messages)} message(s) sent."
+    )
+
+    def event_stream():
+        try:
+            with requests.post(
+                url, headers=headers, json=payload, stream=True, timeout=timeouts
+            ) as response:
+                if response.status_code >= 400:
+                    yield _ndjson({"error": _upstream_error(response)})
+                    return
+
+                # A server that ignores "stream": true answers with one plain
+                # JSON body. Deliver that as a single delta rather than failing.
+                content_type = (response.headers.get("Content-Type") or "").lower()
+                if "text/event-stream" not in content_type:
+                    try:
+                        body = response.json()
+                    except ValueError:
+                        yield _ndjson(
+                            {
+                                "error": "The chat endpoint returned a response that was neither a stream nor JSON."
+                            }
+                        )
+                        return
+                    text = _completion_text(body if isinstance(body, dict) else {})
+                    if text:
+                        yield _ndjson({"delta": text})
+                    yield _ndjson({"done": True})
+                    return
+
+                for raw_line in response.iter_lines(decode_unicode=True):
+                    if not raw_line:
+                        continue
+                    line = raw_line.strip()
+                    if line.startswith("data:"):
+                        line = line[len("data:") :].strip()
+                    if not line or line == "[DONE]":
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(chunk, dict):
+                        continue
+                    if chunk.get("error"):
+                        error = chunk["error"]
+                        message = (
+                            error.get("message")
+                            if isinstance(error, dict)
+                            else str(error)
+                        )
+                        yield _ndjson(
+                            {"error": message or "The chat endpoint reported an error."}
+                        )
+                        return
+                    text = _completion_text(chunk)
+                    if text:
+                        yield _ndjson({"delta": text})
+            yield _ndjson({"done": True})
+        except requests.RequestException as e:
+            logger.error(f"Chat endpoint request failed: {e}")
+            yield _ndjson({"error": f"Could not reach the chat endpoint: {e}"})
+        except Exception as e:  # The stream has to terminate with something readable.
+            logger.error(
+                f"Unexpected error while streaming a chat reply: {e}", exc_info=True
+            )
+            yield _ndjson({"error": f"Unexpected error while streaming the reply: {e}"})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+def _plain_emotion_label(preset_name: str) -> str:
+    """
+    Reduces a preset name like the Neutral one to its bare word.
+
+    The emoji are there for the buttons in the UI; asking a model to reproduce
+    them exactly is a needless way to fail a match.
+    """
+    return re.sub(r"[^A-Za-z0-9 /-]+", "", preset_name or "").strip()
+
+
+def _match_emotion_preset(
+    answer: str, presets: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Finds the preset a model's one-word answer refers to, if any."""
+    cleaned = _plain_emotion_label(answer).lower()
+    if not cleaned:
+        return None
+    labelled = [(_plain_emotion_label(p.get("name", "")).lower(), p) for p in presets]
+    for label, preset in labelled:
+        if label and label == cleaned:
+            return preset
+    # Models like to answer in a sentence however firmly they are told not to.
+    for label, preset in labelled:
+        if label and re.search(rf"\b{re.escape(label)}\b", cleaned):
+            return preset
+    return None
+
+
+@app.post("/api/chat/emotion", response_model=ChatEmotionResponse, tags=["Chat"])
+def chat_emotion_endpoint(request: ChatEmotionRequest):
+    """
+    Asks the chat model how a reply should be delivered, and returns the matching
+    preset from ui/emotion_presets.yaml.
+
+    Only the presets the UI already ships are offered as answers, so whatever the
+    model says maps onto generation parameters that are known to be sane. An
+    unrecognised answer comes back as an empty emotion, which the page treats as
+    "leave the General tab's settings alone".
+    """
+    try:
+        loaded_presets = _load_ui_preset_file("emotion_presets.yaml")
+    except Exception as e:
+        logger.error(f"Could not read the emotion presets: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, detail="The emotion preset file could not be read."
+        )
+
+    presets = [
+        p
+        for p in loaded_presets
+        if isinstance(p, dict) and p.get("name") and isinstance(p.get("params"), dict)
+    ]
+    if not presets:
+        raise HTTPException(
+            status_code=500, detail="No emotion presets are available to choose from."
+        )
+
+    labels = [_plain_emotion_label(p["name"]) for p in presets]
+    cfg = get_chat_config()
+
+    conversation = "\n".join(
+        f"{'User' if m.role == 'user' else 'Assistant'}: {m.content}"
+        for m in request.context[-6:]
+    )
+    instruction = (
+        "You choose how a line of dialogue should be performed by a "
+        "text-to-speech voice. Reply with exactly one label from the list and "
+        "nothing else."
+    )
+    question = (
+        (f"Conversation so far:\n{conversation}\n\n" if conversation else "")
+        + f"Line to be spoken aloud:\n{request.text}\n\n"
+        + f"Labels: {', '.join(labels)}\n\n"
+        + "Which label fits how this line should be delivered?"
+    )
+
+    payload = _chat_completion_payload(
+        cfg,
+        [
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": question},
+        ],
+        stream=False,
+        model=(cfg.get("emotion_model") or "").strip() or None,
+        temperature=0.0,
+        max_tokens=16,
+    )
+    answer = _request_chat_completion(cfg, payload)
+    match = _match_emotion_preset(answer, presets)
+    if not match:
+        logger.info(
+            "Emotion labelling produced no usable label; keeping the General tab's settings."
+        )
+        return ChatEmotionResponse(emotion="", params={})
+
+    params = {
+        key: float(value)
+        for key, value in match["params"].items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+    logger.info(f"Reply labelled as '{match['name']}'.")
+    return ChatEmotionResponse(emotion=match["name"], params=params)
+
+
+@app.post(
+    "/api/chat/transcribe", response_model=ChatTranscriptionResponse, tags=["Chat"]
+)
+def chat_transcribe_endpoint(file: UploadFile = File(...)):
+    """
+    Turns a recorded voice message into text using the configured transcription
+    endpoint - anything that implements OpenAI's /audio/transcriptions.
+    """
+    cfg = get_chat_config()
+    base_url = (cfg.get("stt_base_url") or "").strip() or cfg.get("base_url", "")
+    url = _chat_url(base_url, "/audio/transcriptions")
+    model = (cfg.get("stt_model") or "").strip()
+    if not model:
+        raise HTTPException(
+            status_code=400,
+            detail="No transcription model is configured. Set one in the Chat tab's settings.",
+        )
+
+    audio_bytes = file.file.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="The recording was empty.")
+
+    try:
+        response = requests.post(
+            url,
+            headers=_chat_headers(cfg.get("api_key", ""), json_body=False),
+            files={
+                "file": (
+                    file.filename or "voice-message.webm",
+                    audio_bytes,
+                    file.content_type or "application/octet-stream",
+                )
+            },
+            data={"model": model, "response_format": "json"},
+            timeout=_chat_timeouts(cfg),
+        )
+    except requests.RequestException as e:
+        raise HTTPException(
+            status_code=502, detail=f"Could not reach the transcription endpoint: {e}"
+        )
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=502, detail=_upstream_error(response))
+
+    try:
+        body = response.json()
+    except ValueError:
+        # A plain-text body is a legitimate answer from some servers.
+        return ChatTranscriptionResponse(text=(response.text or "").strip())
+
+    text = str(body.get("text") or "") if isinstance(body, dict) else ""
+    logger.info(f"Transcribed a voice message ({len(text)} characters).")
+    return ChatTranscriptionResponse(text=text.strip())
 
 
 # --- Main Execution ---

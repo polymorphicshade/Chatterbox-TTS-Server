@@ -152,34 +152,27 @@ document.addEventListener('DOMContentLoaded', async function () {
     const tagButtons = document.querySelectorAll('.tag-btn');
 
 
-    // Handle voice mode selection visual feedback
-    const voiceModeOptions = document.querySelectorAll('.voice-mode__option');
+    // Handle segmented-choice visual feedback. The highlight is cleared only
+    // within the group the changed radio belongs to, so the several .voice-mode
+    // groups on the page (voice mode, chat emotion mode) do not blank each other.
+    function markSelectedOption(radio) {
+        const group = radio.closest('.voice-mode');
+        if (!group) return;
+        group.querySelectorAll('.voice-mode__option').forEach(option => {
+            option.classList.remove('selected');
+        });
+        const selectedOption = radio.closest('.voice-mode__option');
+        if (selectedOption) selectedOption.classList.add('selected');
+    }
 
-    voiceModeRadios.forEach(radio => {
+    document.querySelectorAll('.voice-mode input[type="radio"]').forEach(radio => {
         radio.addEventListener('change', function () {
-            // Remove selected class from all options
-            voiceModeOptions.forEach(option => {
-                option.classList.remove('selected');
-            });
-
-            // Add selected class to the parent of the checked radio
-            // CORRECTED: Selector updated to match HTML
-            const selectedOption = this.closest('.voice-mode__option');
-            if (selectedOption) {
-                selectedOption.classList.add('selected');
-            }
+            markSelectedOption(this);
         });
     });
 
     // Set initial state
-    const checkedRadio = document.querySelector('input[name="voice_mode"]:checked');
-    if (checkedRadio) {
-        // CORRECTED: Selector updated to match HTML
-        const selectedOption = checkedRadio.closest('.voice-mode__option');
-        if (selectedOption) {
-            selectedOption.classList.add('selected');
-        }
-    }
+    document.querySelectorAll('.voice-mode input[type="radio"]:checked').forEach(markSelectedOption);
 
     // --- Utility Functions ---
     function formatErrorDetail(detail) {
@@ -285,6 +278,7 @@ document.addEventListener('DOMContentLoaded', async function () {
             hide_generation_warning: hideGenerationWarning,
             theme: localStorage.getItem('uiTheme') || 'dark',
             last_preset_name: currentPresetName,
+            last_active_tab: activeTab,
         };
 
         try {
@@ -638,6 +632,8 @@ document.addEventListener('DOMContentLoaded', async function () {
         updateSpeedFactorWarning(); // Initial check for speed factor warning
         updateVolumeLabel();
         updateEmotionVisuals();
+        initializeChat();
+        setActiveTab(currentUiState.last_active_tab || 'general', false);
         const initialGenResult = currentConfig.initial_gen_result;
         if (initialGenResult && initialGenResult.outputUrl) {
             initializeWaveSurfer(initialGenResult.outputUrl, initialGenResult);
@@ -1745,6 +1741,656 @@ document.addEventListener('DOMContentLoaded', async function () {
                 predefinedVoiceRefreshButton.disabled = false;
                 predefinedVoiceRefreshButton.innerHTML = originalButtonIcon;
             }
+        });
+    }
+
+    // ============================================================
+    // Tabs
+    // ============================================================
+    const tabButtons = document.querySelectorAll('.tabs__tab');
+    const tabPanels = {
+        general: document.getElementById('tab-panel-general'),
+        chat: document.getElementById('tab-panel-chat')
+    };
+    let activeTab = 'general';
+
+    function setActiveTab(name, save = true) {
+        if (!tabPanels[name]) name = 'general';
+        activeTab = name;
+        tabButtons.forEach(button => {
+            const isActive = button.dataset.tab === name;
+            button.classList.toggle('selected', isActive);
+            button.setAttribute('aria-selected', isActive ? 'true' : 'false');
+        });
+        Object.entries(tabPanels).forEach(([key, panel]) => {
+            if (panel) panel.classList.toggle('hidden', key !== name);
+        });
+        if (save) debouncedSaveState();
+    }
+
+    tabButtons.forEach(button => {
+        button.addEventListener('click', () => setActiveTab(button.dataset.tab));
+    });
+
+    // ============================================================
+    // Chat Tab
+    // ============================================================
+    // Talks to the user's OpenAI-compatible endpoint through the server's
+    // /api/chat/* proxy, and speaks each reply with the voice and generation
+    // settings currently set on the General tab.
+
+    const chatLog = document.getElementById('chat-log');
+    const chatEmptyMessage = document.getElementById('chat-empty');
+    const chatInput = document.getElementById('chat-input');
+    const chatSendBtn = document.getElementById('chat-send-btn');
+    const chatMicBtn = document.getElementById('chat-mic-btn');
+    const chatMicLabel = document.getElementById('chat-mic-label');
+    const chatClearBtn = document.getElementById('chat-clear-btn');
+    const chatStopAudioBtn = document.getElementById('chat-stop-audio-btn');
+    const chatStatus = document.getElementById('chat-status');
+    const chatAutoplayToggle = document.getElementById('chat-autoplay-toggle');
+    const chatBaseUrlInput = document.getElementById('chat-base-url');
+    const chatApiKeyInput = document.getElementById('chat-api-key');
+    const chatModelInput = document.getElementById('chat-model');
+    const chatModelList = document.getElementById('chat-model-list');
+    const chatModelsRefreshBtn = document.getElementById('chat-models-refresh-btn');
+    const chatTemperatureSlider = document.getElementById('chat-temperature');
+    const chatTemperatureValue = document.getElementById('chat-temperature-value');
+    const chatMaxTokensInput = document.getElementById('chat-max-tokens');
+    const chatHistoryTurnsInput = document.getElementById('chat-history-turns');
+    const chatSystemMessageInput = document.getElementById('chat-system-message');
+    const chatEmotionModeRadios = document.querySelectorAll('input[name="chat_emotion_mode"]');
+    const chatEmotionModelGroup = document.getElementById('chat-emotion-model-group');
+    const chatEmotionModelInput = document.getElementById('chat-emotion-model');
+    const chatSttBaseUrlInput = document.getElementById('chat-stt-base-url');
+    const chatSttModelInput = document.getElementById('chat-stt-model');
+    const chatSettingsStatus = document.getElementById('chat-settings-status');
+
+    const CHAT_SETTINGS_SAVE_DELAY_MS = 900;
+
+    // The conversation as sent to the endpoint. Only completed turns live here:
+    // a reply that errored part-way is shown but never becomes context.
+    let chatConversation = [];
+    let chatIsStreaming = false;
+    let chatSettingsSaveTimeout = null;
+    let chatAudio = null;
+    let chatAudioUrl = null;
+    let chatMediaRecorder = null;
+    let chatRecordedChunks = [];
+
+    function setChatStatus(message) {
+        if (chatStatus) chatStatus.textContent = message || '';
+    }
+
+    function scrollChatLogToBottom() {
+        if (chatLog) chatLog.scrollTop = chatLog.scrollHeight;
+    }
+
+    // Replies are read aloud, so markup that would otherwise be spelled out
+    // letter by letter is stripped before the text reaches the TTS engine.
+    function textForSpeech(text) {
+        return (text || '')
+            .replace(/```[\s\S]*?```/g, ' ')
+            .replace(/`([^`]*)`/g, '$1')
+            .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+            .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+            .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+            .replace(/^\s{0,3}>\s?/gm, '')
+            .replace(/^\s{0,3}[-*+]\s+/gm, '')
+            .replace(/(\*\*|__)(.*?)\1/g, '$2')
+            .replace(/(\*|_)(.*?)\1/g, '$2')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    // --- Chat Message Rendering ---
+    function appendChatMessage(role, text, options = {}) {
+        if (!chatLog) return null;
+        if (chatEmptyMessage) chatEmptyMessage.classList.add('hidden');
+
+        const wrapper = document.createElement('div');
+        wrapper.className = `chat__message ${role}`;
+
+        const roleLabel = document.createElement('span');
+        roleLabel.className = 'chat__role';
+        roleLabel.textContent = role === 'user' ? 'You' : (options.roleLabel || 'Assistant');
+        wrapper.appendChild(roleLabel);
+
+        const bubble = document.createElement('div');
+        bubble.className = 'chat__bubble';
+        if (options.typing) {
+            bubble.innerHTML = '<span class="chat__typing">•••</span>';
+        } else {
+            bubble.textContent = text;
+        }
+        wrapper.appendChild(bubble);
+
+        const meta = document.createElement('div');
+        meta.className = 'chat__meta hidden';
+        wrapper.appendChild(meta);
+
+        chatLog.appendChild(wrapper);
+        scrollChatLogToBottom();
+
+        return {
+            wrapper,
+            bubble,
+            meta,
+            setText(value) {
+                bubble.textContent = value;
+            },
+            markError(message) {
+                wrapper.classList.remove('assistant', 'user');
+                wrapper.classList.add('assistant', 'error');
+                roleLabel.textContent = 'Error';
+                bubble.textContent = message;
+            },
+            addEmotionBadge(emotion) {
+                // Replaced rather than appended: replaying a reply can land on a
+                // different label, and only the current one is true.
+                let badge = meta.querySelector('.chat__emotion');
+                if (!badge) {
+                    badge = document.createElement('span');
+                    badge.className = 'chat__emotion';
+                    badge.title = 'Emotion preset applied to this reply';
+                    meta.insertBefore(badge, meta.firstChild);
+                }
+                badge.textContent = emotion;
+                meta.classList.remove('hidden');
+            },
+            addReplayButton(onPlay) {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'chat__replay';
+                button.textContent = '🔊 Speak';
+                button.title = 'Generate and play this reply';
+                button.addEventListener('click', async () => {
+                    button.disabled = true;
+                    try {
+                        await onPlay();
+                    } finally {
+                        button.disabled = false;
+                    }
+                });
+                meta.classList.remove('hidden');
+                meta.appendChild(button);
+            }
+        };
+    }
+
+    // --- Reply Playback ---
+    function stopChatAudio() {
+        if (chatAudio) {
+            chatAudio.pause();
+            chatAudio = null;
+        }
+        if (chatAudioUrl) {
+            URL.revokeObjectURL(chatAudioUrl);
+            chatAudioUrl = null;
+        }
+        if (chatStopAudioBtn) chatStopAudioBtn.classList.add('hidden');
+    }
+
+    async function playChatAudioBlob(blob) {
+        stopChatAudio();
+        chatAudioUrl = URL.createObjectURL(blob);
+        const audio = new Audio(chatAudioUrl);
+        audio.addEventListener('ended', stopChatAudio);
+        chatAudio = audio;
+        if (chatStopAudioBtn) chatStopAudioBtn.classList.remove('hidden');
+        try {
+            await audio.play();
+        } catch (error) {
+            // Autoplay policies can refuse playback that is not close enough to a
+            // click. The audio is ready either way, so point at the replay button.
+            stopChatAudio();
+            showNotification('The browser blocked automatic playback. Use the Speak button on the reply.', 'warning');
+        }
+    }
+
+    function currentChatEmotionMode() {
+        const checked = document.querySelector('input[name="chat_emotion_mode"]:checked');
+        return checked ? checked.value : 'general';
+    }
+
+    // Reports what is missing for the General tab's voice settings to be usable,
+    // or an empty string when they are ready to generate with.
+    function describeMissingVoiceSelection() {
+        if (currentVoiceMode === 'predefined' && (!predefinedVoiceSelect || predefinedVoiceSelect.value === 'none')) {
+            return 'Select a predefined voice on the General tab before replies can be spoken.';
+        }
+        if (currentVoiceMode === 'clone' && (!cloneReferenceSelect || cloneReferenceSelect.value === 'none')) {
+            return 'Select a reference audio file on the General tab before replies can be spoken.';
+        }
+        return '';
+    }
+
+    async function detectReplyEmotion(spokenText, messageUi) {
+        const contextTurns = chatConversation
+            .slice(-7, -1)
+            .map(message => ({ role: message.role, content: message.content }));
+        setChatStatus('Choosing a delivery...');
+        try {
+            const response = await fetch(`${API_BASE_URL}/api/chat/emotion`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text: spokenText, context: contextTurns })
+            });
+            const result = await response.json();
+            if (!response.ok) throw new Error(formatErrorDetail(result.detail) || 'Emotion detection failed.');
+            if (result.emotion && messageUi) messageUi.addEmotionBadge(result.emotion);
+            return result.params || {};
+        } catch (error) {
+            console.error('Emotion detection failed:', error);
+            // A missed label is not worth losing the reply over - speak it with
+            // the General tab's settings and say why.
+            showNotification(`Emotion detection failed, using the General tab's settings: ${error.message}`, 'warning');
+            return {};
+        }
+    }
+
+    async function speakChatReply(text, messageUi) {
+        const spokenText = textForSpeech(text);
+        if (!spokenText) return;
+
+        const missingVoice = describeMissingVoiceSelection();
+        if (missingVoice) {
+            showNotification(missingVoice, 'warning');
+            return;
+        }
+
+        const payload = getTTSFormData();
+        payload.text = spokenText;
+
+        if (currentChatEmotionMode() === 'auto') {
+            Object.assign(payload, await detectReplyEmotion(spokenText, messageUi));
+        }
+
+        setChatStatus('Generating speech...');
+        try {
+            const response = await fetch(`${API_BASE_URL}/tts`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            if (!response.ok) {
+                const errorResult = await response.json().catch(() => ({ detail: `HTTP error ${response.status}` }));
+                throw new Error(formatErrorDetail(errorResult.detail) || 'Speech generation failed.');
+            }
+            await playChatAudioBlob(await response.blob());
+        } catch (error) {
+            console.error('Chat speech generation failed:', error);
+            showNotification(`Could not speak the reply: ${error.message}`, 'error');
+        } finally {
+            setChatStatus('');
+        }
+    }
+
+    // --- Sending A Message ---
+    function setChatBusy(busy) {
+        chatIsStreaming = busy;
+        if (chatSendBtn) chatSendBtn.disabled = busy;
+        if (chatMicBtn) chatMicBtn.disabled = busy;
+    }
+
+    async function sendChatMessage() {
+        if (chatIsStreaming || !chatInput) return;
+        const messageText = chatInput.value.trim();
+        if (!messageText) return;
+
+        chatInput.value = '';
+        appendChatMessage('user', messageText);
+        chatConversation.push({ role: 'user', content: messageText });
+
+        const replyUi = appendChatMessage('assistant', '', { typing: true });
+        setChatBusy(true);
+        setChatStatus('Waiting for the endpoint...');
+
+        let reply = '';
+        try {
+            const response = await fetch(`${API_BASE_URL}/api/chat/completions`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ messages: chatConversation })
+            });
+            if (!response.ok) {
+                const errorResult = await response.json().catch(() => ({ detail: `HTTP error ${response.status}` }));
+                throw new Error(formatErrorDetail(errorResult.detail) || 'The chat request failed.');
+            }
+            if (!response.body) throw new Error('This browser cannot read streamed responses.');
+
+            // The proxy answers in newline-delimited JSON: one {"delta"},
+            // {"error"} or {"done"} record per line.
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let streamError = null;
+
+            while (!streamError) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+
+                let newlineIndex;
+                while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
+                    const line = buffer.slice(0, newlineIndex).trim();
+                    buffer = buffer.slice(newlineIndex + 1);
+                    if (!line) continue;
+
+                    let record;
+                    try {
+                        record = JSON.parse(line);
+                    } catch (parseError) {
+                        continue;
+                    }
+                    if (record.error) {
+                        streamError = record.error;
+                        break;
+                    }
+                    if (record.delta) {
+                        reply += record.delta;
+                        replyUi.setText(reply);
+                        setChatStatus('Replying...');
+                        scrollChatLogToBottom();
+                    }
+                }
+            }
+
+            if (streamError) throw new Error(streamError);
+            if (!reply.trim()) throw new Error('The chat endpoint returned an empty reply.');
+
+            chatConversation.push({ role: 'assistant', content: reply });
+            replyUi.addReplayButton(() => speakChatReply(reply, replyUi));
+            scrollChatLogToBottom();
+
+            if (chatAutoplayToggle && chatAutoplayToggle.checked) {
+                await speakChatReply(reply, replyUi);
+            }
+        } catch (error) {
+            console.error('Chat request failed:', error);
+            // Whatever arrived before the failure is worth keeping on screen, so
+            // a partial reply gets the error appended rather than replacing it.
+            if (reply.trim()) {
+                replyUi.setText(`${reply}\n\n[Interrupted: ${error.message}]`);
+            } else {
+                replyUi.markError(error.message);
+            }
+        } finally {
+            setChatBusy(false);
+            setChatStatus('');
+        }
+    }
+
+    // --- Voice Input ---
+    function setChatRecordingUI(isRecording) {
+        if (!chatMicBtn) return;
+        chatMicBtn.classList.toggle('recording', isRecording);
+        if (chatMicLabel) chatMicLabel.textContent = isRecording ? 'Stop' : 'Speak';
+        chatMicBtn.title = isRecording ? 'Stop recording and transcribe' : 'Record a voice message and transcribe it';
+        // Sending mid-recording would leave the recorder running with no way to
+        // stop it, since a request in flight disables this button.
+        if (chatSendBtn) chatSendBtn.disabled = isRecording;
+    }
+
+    function recordingFileName(mimeType) {
+        const type = (mimeType || '').toLowerCase();
+        if (type.includes('ogg')) return 'voice-message.ogg';
+        if (type.includes('mp4') || type.includes('m4a') || type.includes('aac')) return 'voice-message.mp4';
+        if (type.includes('mpeg') || type.includes('mp3')) return 'voice-message.mp3';
+        if (type.includes('wav')) return 'voice-message.wav';
+        return 'voice-message.webm';
+    }
+
+    async function transcribeRecording(blob) {
+        if (!blob || blob.size === 0) {
+            showNotification('Nothing was recorded.', 'warning');
+            return;
+        }
+        setChatStatus('Transcribing...');
+        const formData = new FormData();
+        formData.append('file', blob, recordingFileName(blob.type));
+        try {
+            const response = await fetch(`${API_BASE_URL}/api/chat/transcribe`, {
+                method: 'POST',
+                body: formData
+            });
+            const result = await response.json();
+            if (!response.ok) throw new Error(formatErrorDetail(result.detail) || 'Transcription failed.');
+            const text = (result.text || '').trim();
+            if (!text) {
+                showNotification('Nothing was recognised in that recording.', 'warning');
+                return;
+            }
+            // The text lands in the box rather than being sent straight off, so a
+            // misheard word can be fixed before the model ever sees it.
+            if (chatInput) {
+                chatInput.value = chatInput.value.trim() ? `${chatInput.value.trim()} ${text}` : text;
+                chatInput.focus();
+            }
+        } catch (error) {
+            console.error('Transcription failed:', error);
+            showNotification(`Transcription failed: ${error.message}`, 'error');
+        } finally {
+            setChatStatus('');
+        }
+    }
+
+    async function toggleChatRecording() {
+        if (chatMediaRecorder && chatMediaRecorder.state === 'recording') {
+            chatMediaRecorder.stop();
+            return;
+        }
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === 'undefined') {
+            // Browsers only expose the microphone on secure origins, which is why
+            // this can be missing on a plain-http LAN address but not on localhost.
+            showNotification('Microphone recording is unavailable. It needs a browser on localhost or an HTTPS connection.', 'error');
+            return;
+        }
+
+        let stream;
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch (error) {
+            console.error('Microphone access failed:', error);
+            showNotification('Microphone access was refused.', 'error');
+            return;
+        }
+
+        chatRecordedChunks = [];
+        const recorder = new MediaRecorder(stream);
+        recorder.addEventListener('dataavailable', event => {
+            if (event.data && event.data.size > 0) chatRecordedChunks.push(event.data);
+        });
+        recorder.addEventListener('stop', async () => {
+            stream.getTracks().forEach(track => track.stop());
+            setChatRecordingUI(false);
+            chatMediaRecorder = null;
+            const blob = new Blob(chatRecordedChunks, { type: recorder.mimeType || 'audio/webm' });
+            chatRecordedChunks = [];
+            await transcribeRecording(blob);
+        });
+
+        chatMediaRecorder = recorder;
+        recorder.start();
+        setChatRecordingUI(true);
+        setChatStatus('Recording... press Stop when you are done.');
+    }
+
+    // --- Chat Settings ---
+    function collectChatSettings() {
+        const maxTokens = parseInt(chatMaxTokensInput ? chatMaxTokensInput.value : '', 10);
+        const historyTurns = parseInt(chatHistoryTurnsInput ? chatHistoryTurnsInput.value : '', 10);
+        return {
+            base_url: chatBaseUrlInput ? chatBaseUrlInput.value.trim() : '',
+            api_key: chatApiKeyInput ? chatApiKeyInput.value : '',
+            model: chatModelInput ? chatModelInput.value.trim() : '',
+            system_message: chatSystemMessageInput ? chatSystemMessageInput.value : '',
+            temperature: chatTemperatureSlider ? parseFloat(chatTemperatureSlider.value) : 0.8,
+            max_tokens: Number.isFinite(maxTokens) ? Math.max(0, maxTokens) : 0,
+            history_turns: Number.isFinite(historyTurns) ? Math.max(0, historyTurns) : 12,
+            auto_play: chatAutoplayToggle ? chatAutoplayToggle.checked : true,
+            emotion_mode: currentChatEmotionMode(),
+            emotion_model: chatEmotionModelInput ? chatEmotionModelInput.value.trim() : '',
+            stt_base_url: chatSttBaseUrlInput ? chatSttBaseUrlInput.value.trim() : '',
+            stt_model: chatSttModelInput ? chatSttModelInput.value.trim() : ''
+        };
+    }
+
+    async function saveChatSettings() {
+        const settings = collectChatSettings();
+        if (chatSettingsStatus) {
+            chatSettingsStatus.textContent = 'Saving...';
+            chatSettingsStatus.classList.remove('hidden');
+        }
+        try {
+            const response = await fetch(`${API_BASE_URL}/save_settings`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ chat: settings })
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(formatErrorDetail(result.detail) || 'Could not save the chat settings.');
+            currentConfig.chat = Object.assign({}, currentConfig.chat, settings);
+            if (chatSettingsStatus) {
+                chatSettingsStatus.textContent = 'Saved.';
+                setTimeout(() => chatSettingsStatus.classList.add('hidden'), 2000);
+            }
+        } catch (error) {
+            console.error('Error saving chat settings:', error);
+            if (chatSettingsStatus) chatSettingsStatus.textContent = `Error: ${error.message}`;
+        }
+    }
+
+    function debouncedSaveChatSettings() {
+        if (!uiReady || !listenersAttached) return;
+        clearTimeout(chatSettingsSaveTimeout);
+        chatSettingsSaveTimeout = setTimeout(saveChatSettings, CHAT_SETTINGS_SAVE_DELAY_MS);
+    }
+
+    function updateChatEmotionModelVisibility() {
+        if (chatEmotionModelGroup) {
+            chatEmotionModelGroup.classList.toggle('hidden', currentChatEmotionMode() !== 'auto');
+        }
+    }
+
+    function applyChatSettingsToForm() {
+        const settings = currentConfig.chat || {};
+        if (chatBaseUrlInput) chatBaseUrlInput.value = settings.base_url || '';
+        if (chatApiKeyInput) chatApiKeyInput.value = settings.api_key || '';
+        if (chatModelInput) chatModelInput.value = settings.model || '';
+        if (chatSystemMessageInput) chatSystemMessageInput.value = settings.system_message || '';
+        if (chatTemperatureSlider) {
+            chatTemperatureSlider.value = settings.temperature !== undefined ? settings.temperature : 0.8;
+            if (chatTemperatureValue) chatTemperatureValue.textContent = chatTemperatureSlider.value;
+        }
+        if (chatMaxTokensInput) chatMaxTokensInput.value = settings.max_tokens !== undefined ? settings.max_tokens : 512;
+        if (chatHistoryTurnsInput) chatHistoryTurnsInput.value = settings.history_turns !== undefined ? settings.history_turns : 12;
+        // Auto-play is on unless it was explicitly turned off.
+        if (chatAutoplayToggle) chatAutoplayToggle.checked = settings.auto_play !== false;
+        if (chatEmotionModelInput) chatEmotionModelInput.value = settings.emotion_model || '';
+        if (chatSttBaseUrlInput) chatSttBaseUrlInput.value = settings.stt_base_url || '';
+        if (chatSttModelInput) chatSttModelInput.value = settings.stt_model || '';
+
+        const emotionMode = settings.emotion_mode === 'auto' ? 'auto' : 'general';
+        chatEmotionModeRadios.forEach(radio => {
+            radio.checked = radio.value === emotionMode;
+            const option = radio.closest('.voice-mode__option');
+            if (option) option.classList.toggle('selected', radio.checked);
+        });
+        updateChatEmotionModelVisibility();
+    }
+
+    async function refreshChatModels() {
+        if (!chatModelsRefreshBtn) return;
+        const originalHTML = chatModelsRefreshBtn.innerHTML;
+        chatModelsRefreshBtn.disabled = true;
+        chatModelsRefreshBtn.innerHTML = `<svg class="animate-spin h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>`;
+        try {
+            // Settings are saved as you type; make sure the URL in the box is the
+            // one the server uses before asking it for the list.
+            clearTimeout(chatSettingsSaveTimeout);
+            await saveChatSettings();
+
+            const response = await fetch(`${API_BASE_URL}/api/chat/models`);
+            const result = await response.json();
+            if (!response.ok) throw new Error(formatErrorDetail(result.detail) || 'Could not list models.');
+            const models = result.models || [];
+            if (chatModelList) {
+                chatModelList.innerHTML = '';
+                models.forEach(name => {
+                    const option = document.createElement('option');
+                    option.value = name;
+                    chatModelList.appendChild(option);
+                });
+            }
+            showNotification(
+                models.length
+                    ? `Endpoint offers ${models.length} model(s). Start typing in the Model box to pick one.`
+                    : 'The endpoint reported no models.',
+                models.length ? 'success' : 'warning',
+                4000
+            );
+        } catch (error) {
+            console.error('Error listing chat models:', error);
+            showNotification(`Could not list models: ${error.message}`, 'error');
+        } finally {
+            chatModelsRefreshBtn.disabled = false;
+            chatModelsRefreshBtn.innerHTML = originalHTML;
+        }
+    }
+
+    function clearChatConversation() {
+        stopChatAudio();
+        chatConversation = [];
+        if (chatLog) {
+            chatLog.innerHTML = '';
+            if (chatEmptyMessage) {
+                chatEmptyMessage.classList.remove('hidden');
+                chatLog.appendChild(chatEmptyMessage);
+            }
+        }
+        setChatStatus('');
+    }
+
+    function initializeChat() {
+        applyChatSettingsToForm();
+
+        if (chatSendBtn) chatSendBtn.addEventListener('click', sendChatMessage);
+        if (chatMicBtn) chatMicBtn.addEventListener('click', toggleChatRecording);
+        if (chatClearBtn) chatClearBtn.addEventListener('click', clearChatConversation);
+        if (chatStopAudioBtn) chatStopAudioBtn.addEventListener('click', stopChatAudio);
+        if (chatModelsRefreshBtn) chatModelsRefreshBtn.addEventListener('click', refreshChatModels);
+
+        if (chatInput) {
+            chatInput.addEventListener('keydown', event => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault();
+                    sendChatMessage();
+                }
+            });
+        }
+
+        const textSettings = [
+            chatBaseUrlInput, chatApiKeyInput, chatModelInput, chatSystemMessageInput,
+            chatMaxTokensInput, chatHistoryTurnsInput, chatEmotionModelInput,
+            chatSttBaseUrlInput, chatSttModelInput
+        ];
+        textSettings.forEach(input => {
+            if (input) input.addEventListener('input', debouncedSaveChatSettings);
+        });
+
+        if (chatTemperatureSlider) {
+            chatTemperatureSlider.addEventListener('input', () => {
+                if (chatTemperatureValue) chatTemperatureValue.textContent = chatTemperatureSlider.value;
+            });
+            chatTemperatureSlider.addEventListener('change', debouncedSaveChatSettings);
+        }
+        if (chatAutoplayToggle) chatAutoplayToggle.addEventListener('change', debouncedSaveChatSettings);
+        chatEmotionModeRadios.forEach(radio => {
+            radio.addEventListener('change', () => {
+                updateChatEmotionModelVisibility();
+                debouncedSaveChatSettings();
+            });
         });
     }
 
