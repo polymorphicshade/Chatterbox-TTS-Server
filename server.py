@@ -57,6 +57,7 @@ from config import (
     get_gen_default_cfg_weight,
     get_gen_default_seed,
     get_gen_default_speed_factor,
+    get_gen_default_volume,
     get_gen_default_language,
     get_audio_sample_rate,
     get_full_config_for_template,
@@ -80,6 +81,7 @@ class OpenAISpeechRequest(BaseModel):
     voice: str
     response_format: Literal["wav", "opus", "mp3"] = "wav"  # Add "mp3"
     speed: float = 1.0
+    volume: float = 1.0
     seed: Optional[int] = None
     language: Optional[str] = None
 
@@ -1379,6 +1381,9 @@ async def custom_tts_endpoint(
             request.cfg_weight if request.cfg_weight is not None else get_gen_default_cfg_weight()
         )
         seed_val = request.seed if request.seed is not None else get_gen_default_seed()
+        volume_stream = (
+            request.volume if request.volume is not None else get_gen_default_volume()
+        )
         language_val = (
             request.language if request.language is not None else get_gen_default_language()
         )
@@ -1421,6 +1426,9 @@ async def custom_tts_endpoint(
                     )
 
                 audio_np = audio_tensor.cpu().numpy().squeeze().astype(np.float32)
+
+                if volume_stream != 1.0:
+                    audio_np = utils.apply_volume_np(audio_np, volume_stream)
 
                 if not header_sent:
                     yield _create_wav_header(chunk_sr)
@@ -1717,6 +1725,14 @@ async def custom_tts_endpoint(
         )
         perf_monitor.record(f"Speed factor {speed_factor_to_use} applied to full clip")
 
+    # --- Output volume, applied last so it governs the finished clip ---
+    volume_to_use = (
+        request.volume if request.volume is not None else get_gen_default_volume()
+    )
+    if volume_to_use != 1.0:
+        final_audio_np = utils.apply_volume_np(final_audio_np, volume_to_use)
+        perf_monitor.record(f"Output volume {volume_to_use} applied to full clip")
+
     output_format_str = (
         request.output_format if request.output_format else get_audio_output_format()
     )
@@ -1925,6 +1941,10 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
         peak = np.abs(final_audio_np).max()
         if peak > 0.99:
             final_audio_np = final_audio_np * (0.95 / peak)
+
+        # Applied after normalization, which would otherwise undo any boost.
+        if request.volume != 1.0:
+            final_audio_np = utils.apply_volume_np(final_audio_np, request.volume)
 
         encoded_audio = utils.encode_audio(
             audio_array=final_audio_np,

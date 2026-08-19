@@ -108,6 +108,9 @@ document.addEventListener('DOMContentLoaded', async function () {
     const speedFactorSlider = document.getElementById('speed-factor');
     const speedFactorValueDisplay = document.getElementById('speed-factor-value');
     const speedFactorWarningSpan = document.getElementById('speed-factor-warning');
+    const volumeSlider = document.getElementById('volume');
+    const volumeValueDisplay = document.getElementById('volume-value');
+    const volumeWarningSpan = document.getElementById('volume-warning');
     const seedInput = document.getElementById('seed');
     const languageSelectContainer = document.getElementById('language-select-container');
     const languageSelect = document.getElementById('language');
@@ -311,6 +314,23 @@ document.addEventListener('DOMContentLoaded', async function () {
                 speedFactorWarningSpan.classList.remove('hidden');
             } else {
                 speedFactorWarningSpan.classList.add('hidden');
+            }
+        }
+    }
+
+    // --- Output Volume Label ---
+    // The slider works in percent for readability; the API takes a plain factor,
+    // so every read and write of this control converts across that boundary.
+    function updateVolumeLabel() {
+        if (!volumeSlider) return;
+        const percent = parseInt(volumeSlider.value, 10);
+        if (volumeValueDisplay) volumeValueDisplay.textContent = `${percent}%`;
+        if (volumeWarningSpan) {
+            if (percent > 100) {
+                volumeWarningSpan.textContent = "* Peaks are soft-limited above 100%.";
+                volumeWarningSpan.classList.remove('hidden');
+            } else {
+                volumeWarningSpan.classList.add('hidden');
             }
         }
     }
@@ -607,6 +627,7 @@ document.addEventListener('DOMContentLoaded', async function () {
             languageSelectContainer.classList.add('hidden');
         }
         updateSpeedFactorWarning(); // Initial check for speed factor warning
+        updateVolumeLabel();
         const initialGenResult = currentConfig.initial_gen_result;
         if (initialGenResult && initialGenResult.outputUrl) {
             initializeWaveSurfer(initialGenResult.outputUrl, initialGenResult);
@@ -705,6 +726,8 @@ document.addEventListener('DOMContentLoaded', async function () {
         if (cfgWeightValueDisplay) cfgWeightValueDisplay.textContent = cfgWeightSlider.value;
         if (speedFactorSlider) speedFactorSlider.value = genDefaults.speed_factor !== undefined ? genDefaults.speed_factor : 1.0;
         if (speedFactorValueDisplay) speedFactorValueDisplay.textContent = speedFactorSlider.value;
+        if (volumeSlider) volumeSlider.value = Math.round((genDefaults.volume !== undefined ? genDefaults.volume : 1.0) * 100);
+        updateVolumeLabel();
         if (languageSelect) languageSelect.value = genDefaults.language || 'en';
         if (outputFormatSelect) outputFormatSelect.value = currentConfig?.audio_output?.format || 'mp3';
 
@@ -764,6 +787,10 @@ document.addEventListener('DOMContentLoaded', async function () {
                 slider.addEventListener('change', debouncedSaveState);
             }
         });
+        if (volumeSlider) {
+            volumeSlider.addEventListener('input', updateVolumeLabel);
+            volumeSlider.addEventListener('change', debouncedSaveState);
+        }
         if (languageSelect) languageSelect.addEventListener('change', debouncedSaveState);
         if (outputFormatSelect) outputFormatSelect.addEventListener('change', debouncedSaveState);
 
@@ -897,6 +924,7 @@ document.addEventListener('DOMContentLoaded', async function () {
         if (exaggerationSlider && genParams.exaggeration !== undefined) exaggerationSlider.value = genParams.exaggeration;
         if (cfgWeightSlider && genParams.cfg_weight !== undefined) cfgWeightSlider.value = genParams.cfg_weight;
         if (speedFactorSlider && genParams.speed_factor !== undefined) speedFactorSlider.value = genParams.speed_factor;
+        if (volumeSlider && genParams.volume !== undefined) volumeSlider.value = Math.round(genParams.volume * 100);
         if (seedInput && genParams.seed !== undefined) seedInput.value = genParams.seed;
         if (languageSelect && genParams.language !== undefined) languageSelect.value = genParams.language;
         if (temperatureValueDisplay && temperatureSlider) temperatureValueDisplay.textContent = temperatureSlider.value;
@@ -904,6 +932,7 @@ document.addEventListener('DOMContentLoaded', async function () {
         if (cfgWeightValueDisplay && cfgWeightSlider) cfgWeightValueDisplay.textContent = cfgWeightSlider.value;
         if (speedFactorValueDisplay && speedFactorSlider) speedFactorValueDisplay.textContent = speedFactorSlider.value;
         updateSpeedFactorWarning();
+        updateVolumeLabel();
 
         if (genParams.voice_id && predefinedVoiceSelect) {
             const voiceExists = Array.from(predefinedVoiceSelect.options).some(opt => opt.value === genParams.voice_id);
@@ -1082,6 +1111,7 @@ document.addEventListener('DOMContentLoaded', async function () {
             exaggeration: parseFloat(exaggerationSlider.value),
             cfg_weight: parseFloat(cfgWeightSlider.value),
             speed_factor: parseFloat(speedFactorSlider.value),
+            volume: volumeSlider ? parseInt(volumeSlider.value, 10) / 100 : 1.0,
             seed: parseInt(seedInput.value, 10),
             language: languageSelect.value,
             voice_mode: currentVoiceMode,
@@ -1336,6 +1366,7 @@ document.addEventListener('DOMContentLoaded', async function () {
             const genParams = {
                 temperature: parseFloat(temperatureSlider.value), exaggeration: parseFloat(exaggerationSlider.value),
                 cfg_weight: parseFloat(cfgWeightSlider.value), speed_factor: parseFloat(speedFactorSlider.value),
+                volume: volumeSlider ? parseInt(volumeSlider.value, 10) / 100 : 1.0,
                 seed: parseInt(seedInput.value, 10) || 0, language: languageSelect.value
             };
             updateConfigStatus(saveGenDefaultsBtn, genDefaultsStatus, 'Saving generation defaults...', 'info', 0, false);

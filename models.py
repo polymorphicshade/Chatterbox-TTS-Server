@@ -37,6 +37,12 @@ class GenerationParams(BaseModel):
         le=4.0,
         description="Speed factor for the generated audio. 1.0 is normal speed. Applied post-generation.",
     )
+    volume: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=2.0,
+        description="Output volume of the generated audio. 1.0 is unchanged, 2.0 is double amplitude. Applied post-generation.",
+    )
     language: Optional[str] = Field(
         None,
         description="Language of the text. (Primarily for UI, actual engine may infer)",
@@ -101,6 +107,12 @@ class CustomTTSRequest(BaseModel):
     seed: Optional[int] = Field(None, description="Overrides default seed if provided.")
     speed_factor: Optional[float] = Field(
         None, description="Overrides default speed factor if provided."
+    )
+    volume: Optional[float] = Field(
+        None,
+        ge=0.0,
+        le=2.0,
+        description="Overrides default output volume if provided. 1.0 is unchanged, 2.0 is double amplitude.",
     )
     language: Optional[str] = Field(
         None, description="Overrides default language if provided."

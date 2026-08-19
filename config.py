@@ -79,6 +79,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "cfg_weight": 0.5,  # Classifier-Free Guidance weight, influences adherence to prompt/style.
         "seed": 0,  # Random seed for generation. 0 often means random or engine default.
         "speed_factor": 1.0,  # Controls the speed of the generated speech.
+        "volume": 1.0,  # Output gain applied to the finished audio. 1.0 is unchanged.
         "language": "en",  # Default language for TTS.
     },
     "audio_output": {  # Settings related to the format of generated audio.
@@ -878,6 +879,14 @@ def get_gen_default_speed_factor() -> float:
     return config_manager.get_float(
         "generation_defaults.speed_factor",
         _get_default_from_structure("generation_defaults.speed_factor"),
+    )
+
+
+def get_gen_default_volume() -> float:
+    """Returns the default output volume for TTS generation."""
+    return config_manager.get_float(
+        "generation_defaults.volume",
+        _get_default_from_structure("generation_defaults.volume"),
     )
 
 

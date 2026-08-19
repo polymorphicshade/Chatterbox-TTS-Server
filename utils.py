@@ -725,6 +725,41 @@ def apply_speed_factor_np(
     return stretched_tensor.numpy().astype(np.float32, copy=False)
 
 
+def apply_volume_np(audio_np: np.ndarray, volume: float) -> np.ndarray:
+    """
+    Scales the clip's amplitude by `volume`, where 1.0 leaves it untouched.
+
+    Boosting past unity pushes peaks over full scale, and a plain clip there
+    would square the waveform into audible buzz. Samples above the knee are
+    folded back along a tanh curve instead: the curve meets the straight
+    section at matching slope and approaches full scale without ever crossing
+    it, so loud passages compress smoothly while quieter ones keep the exact
+    shape the model produced.
+    """
+    if volume == 1.0:
+        return audio_np
+    if volume < 0:
+        logger.warning(
+            f"Invalid volume {volume}. Must be non-negative. Returning original audio."
+        )
+        return audio_np
+
+    scaled = np.ascontiguousarray(audio_np, dtype=np.float32) * np.float32(volume)
+
+    SOFT_KNEE = 0.8  # Below this the boost stays perfectly linear.
+    over = np.abs(scaled) > SOFT_KNEE
+    if np.any(over):
+        headroom = 1.0 - SOFT_KNEE
+        excess = (np.abs(scaled[over]) - SOFT_KNEE) / headroom
+        scaled[over] = np.sign(scaled[over]) * (SOFT_KNEE + headroom * np.tanh(excess))
+        logger.debug(
+            f"Volume {volume}: soft-limited {int(over.sum())} of {scaled.size} samples above {SOFT_KNEE}."
+        )
+
+    logger.info(f"Applied output volume {volume}.")
+    return scaled
+
+
 def trim_lead_trail_silence(
     audio_array: np.ndarray,
     sample_rate: int,
