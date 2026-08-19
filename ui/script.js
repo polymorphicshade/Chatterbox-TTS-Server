@@ -15,6 +15,7 @@ document.addEventListener('DOMContentLoaded', async function () {
     let currentConfig = {};
     let currentUiState = {};
     let appPresets = [];
+    let appEmotionPresets = [];
     let initialReferenceFiles = [];
     let initialPredefinedVoices = [];
 
@@ -99,6 +100,8 @@ document.addEventListener('DOMContentLoaded', async function () {
     const cloneFileInput = document.getElementById('clone-file-input');
     const presetsContainer = document.getElementById('presets-container');
     const presetsPlaceholder = document.getElementById('presets-placeholder');
+    const emotionPresetsGroup = document.getElementById('emotion-presets-group');
+    const emotionPresetsContainer = document.getElementById('emotion-presets-container');
     const temperatureSlider = document.getElementById('temperature');
     const temperatureValueDisplay = document.getElementById('temperature-value');
     const exaggerationSlider = document.getElementById('exaggeration');
@@ -411,6 +414,7 @@ document.addEventListener('DOMContentLoaded', async function () {
 
         // Refresh presets to filter based on current model type
         populatePresets();
+        populateEmotionPresets();
 
         // Update language options based on model type
         updateLanguageOptions(modelInfo.type);
@@ -628,6 +632,7 @@ document.addEventListener('DOMContentLoaded', async function () {
         }
         updateSpeedFactorWarning(); // Initial check for speed factor warning
         updateVolumeLabel();
+        updateEmotionVisuals();
         const initialGenResult = currentConfig.initial_gen_result;
         if (initialGenResult && initialGenResult.outputUrl) {
             initializeWaveSurfer(initialGenResult.outputUrl, initialGenResult);
@@ -645,6 +650,7 @@ document.addEventListener('DOMContentLoaded', async function () {
             currentConfig = data.config || {};
             currentUiState = currentConfig.ui_state || {};
             appPresets = data.presets || [];
+            appEmotionPresets = data.emotion_presets || [];
             initialReferenceFiles = data.reference_files || [];
             initialPredefinedVoices = data.predefined_voices || [];
             hideChunkWarning = currentUiState.hide_chunk_warning || false;
@@ -783,6 +789,7 @@ document.addEventListener('DOMContentLoaded', async function () {
                 slider.addEventListener('input', () => {
                     if (valueDisplay) valueDisplay.textContent = slider.value;
                     if (slider.id === 'speed-factor') updateSpeedFactorWarning(); // Update warning on input
+                    updateEmotionVisuals();
                 });
                 slider.addEventListener('change', debouncedSaveState);
             }
@@ -861,8 +868,9 @@ document.addEventListener('DOMContentLoaded', async function () {
     function updatePresetVisuals(name) {
         currentPresetName = name;
 
-        // Find all preset buttons
-        const buttons = document.querySelectorAll('.preset-btn');
+        // Find all preset buttons in this row. Scoped to the container so the
+        // emotion row, which shares the .preset-btn styling, keeps its own state.
+        const buttons = presetsContainer ? presetsContainer.querySelectorAll('.preset-btn') : [];
         buttons.forEach(btn => {
             // We will add data-name to buttons in the next step
             if (btn.dataset.name === name) {
@@ -913,6 +921,75 @@ document.addEventListener('DOMContentLoaded', async function () {
         }
     }
 
+    // --- Emotion Presets ---
+    // Slider-only presets. They set the four generation knobs and nothing else,
+    // so clicking one re-aims an in-progress take instead of replacing it.
+    const EMOTION_SLIDERS = [
+        ['temperature', () => temperatureSlider, () => temperatureValueDisplay],
+        ['exaggeration', () => exaggerationSlider, () => exaggerationValueDisplay],
+        ['cfg_weight', () => cfgWeightSlider, () => cfgWeightValueDisplay],
+        ['speed_factor', () => speedFactorSlider, () => speedFactorValueDisplay],
+    ];
+
+    function populateEmotionPresets() {
+        if (!emotionPresetsGroup || !emotionPresetsContainer) return;
+
+        // Turbo hides exaggeration and CFG weight outright, and the values are
+        // tuned against the original English model, so the row only shows there.
+        const supported = currentModelInfo && currentModelInfo.type === 'original';
+        emotionPresetsGroup.classList.toggle('hidden', !supported || appEmotionPresets.length === 0);
+        if (!supported) return;
+
+        emotionPresetsContainer.innerHTML = '';
+        appEmotionPresets.forEach(preset => {
+            const params = preset.params || {};
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'preset-btn emotion-btn';
+            button.dataset.name = preset.name;
+            button.title = EMOTION_SLIDERS
+                .filter(([key]) => params[key] !== undefined)
+                .map(([key]) => `${key}: ${params[key]}`)
+                .join(', ');
+            button.textContent = preset.name;
+            button.addEventListener('click', () => applyEmotionPreset(preset));
+            emotionPresetsContainer.appendChild(button);
+        });
+        updateEmotionVisuals();
+    }
+
+    // Highlight is derived from the sliders rather than remembered, so it stays
+    // truthful: it clears the moment a slider is dragged off the preset, and it
+    // comes back on reload if these values were saved as the defaults.
+    function updateEmotionVisuals() {
+        if (!emotionPresetsContainer) return;
+        emotionPresetsContainer.querySelectorAll('.emotion-btn').forEach(btn => {
+            const preset = appEmotionPresets.find(p => p.name === btn.dataset.name);
+            const params = (preset && preset.params) || {};
+            const specified = EMOTION_SLIDERS.filter(([key]) => params[key] !== undefined);
+            const matches = specified.length > 0 && specified.every(([key, getSlider]) => {
+                const slider = getSlider();
+                return slider && Math.abs(parseFloat(slider.value) - params[key]) < 1e-6;
+            });
+            btn.classList.toggle('selected', matches);
+        });
+    }
+
+    function applyEmotionPreset(presetData, showNotif = true) {
+        if (!presetData) return;
+        const params = presetData.params || {};
+        EMOTION_SLIDERS.forEach(([key, getSlider, getDisplay]) => {
+            const slider = getSlider();
+            if (!slider || params[key] === undefined) return;
+            slider.value = params[key];
+            const display = getDisplay();
+            if (display) display.textContent = slider.value;
+        });
+        updateSpeedFactorWarning();
+        updateEmotionVisuals();
+        if (showNotif) showNotification(`Emotion preset "${presetData.name}" applied.`, 'info', 3000);
+    }
+
     function applyPreset(presetData, showNotif = true, isUserInteraction = true) {
         if (!presetData) return;
         if (textArea && presetData.text !== undefined) {
@@ -933,6 +1010,7 @@ document.addEventListener('DOMContentLoaded', async function () {
         if (speedFactorValueDisplay && speedFactorSlider) speedFactorValueDisplay.textContent = speedFactorSlider.value;
         updateSpeedFactorWarning();
         updateVolumeLabel();
+        updateEmotionVisuals();
 
         if (genParams.voice_id && predefinedVoiceSelect) {
             const voiceExists = Array.from(predefinedVoiceSelect.options).some(opt => opt.value === genParams.voice_id);

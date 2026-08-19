@@ -1,0 +1,68 @@
+# ui/emotion_presets.yaml
+# Slider presets that aim the delivery at a particular emotion.
+#
+# These target the original (English, non-Turbo) Chatterbox model, which is the
+# only one that exposes both of the knobs they lean on. Turbo hides exaggeration
+# and CFG weight entirely, so the UI hides these buttons unless the original
+# model is loaded.
+#
+# How the knobs read on this model:
+#   exaggeration - emotional intensity. 0.5 is the neutral baseline; raising it
+#                  also tightens and speeds up delivery as a side effect.
+#   cfg_weight   - adherence and pacing. Lowering it slows the cadence and gives
+#                  the model more expressive latitude, which is how the high
+#                  exaggeration values below stay intelligible.
+#   temperature  - variation between takes. Low keeps a steady, even read; high
+#                  lets the delivery break and jump around.
+#   speed_factor - post-generation tempo, on the slider's 0.05 grid.
+#
+# Unlike the example presets in presets.yaml these carry no text, so clicking one
+# re-aims the sliders and leaves whatever you have typed alone. They also leave
+# seed and output volume untouched: pinning a seed would make every take of an
+# emotion identical, and volume is a playback preference rather than part of the
+# performance.
+#
+# Treat the numbers as starting points. Voices differ, and the reference clip has
+# as much say in the result as these sliders do.
+
+- name: "😊 Happy"
+  params:
+    temperature: 0.9
+    exaggeration: 0.85
+    cfg_weight: 0.45
+    speed_factor: 1.05
+
+- name: "😠 Angry"
+  params:
+    temperature: 0.85
+    exaggeration: 1.4
+    cfg_weight: 0.55
+    speed_factor: 1.05
+
+- name: "😢 Sad"
+  params:
+    temperature: 0.7
+    exaggeration: 0.45
+    cfg_weight: 0.35
+    speed_factor: 0.9
+
+- name: "😲 Shocked"
+  params:
+    temperature: 1.0
+    exaggeration: 1.6
+    cfg_weight: 0.4
+    speed_factor: 1.1
+
+- name: "😏 Sexy"
+  params:
+    temperature: 0.75
+    exaggeration: 0.6
+    cfg_weight: 0.3
+    speed_factor: 0.85
+
+- name: "😌 Calming"
+  params:
+    temperature: 0.65
+    exaggeration: 0.35
+    cfg_weight: 0.4
+    speed_factor: 0.9

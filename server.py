@@ -515,6 +515,30 @@ async def get_model_info_endpoint():
 
 
 # --- API Endpoint for Initial UI Data ---
+def _load_ui_preset_file(filename: str) -> List[Dict[str, Any]]:
+    """
+    Reads one of the UI's preset lists out of the ui directory.
+
+    A missing or malformed file costs the UI a row of buttons, not a working
+    page, so this reports the problem and hands back an empty list rather than
+    failing the whole initial-data request.
+    """
+    preset_file = ui_static_path / filename
+    if not preset_file.exists():
+        logger.info(f"Preset file not found: {preset_file}. Loading none from it.")
+        return []
+
+    with open(preset_file, "r", encoding="utf-8") as f:
+        yaml_content = yaml.safe_load(f)
+
+    if not isinstance(yaml_content, list):
+        logger.warning(
+            f"Invalid format in {preset_file}. Expected a list, got {type(yaml_content)}."
+        )
+        return []
+    return yaml_content
+
+
 @app.get("/api/ui/initial-data", tags=["UI Helpers"])
 async def get_ui_initial_data():
     """
@@ -530,21 +554,8 @@ async def get_ui_initial_data():
         # Get model information for UI
         model_info = engine.get_model_info()
 
-        loaded_presets = []
-        presets_file = ui_static_path / "presets.yaml"
-        if presets_file.exists():
-            with open(presets_file, "r", encoding="utf-8") as f:
-                yaml_content = yaml.safe_load(f)
-                if isinstance(yaml_content, list):
-                    loaded_presets = yaml_content
-                else:
-                    logger.warning(
-                        f"Invalid format in {presets_file}. Expected a list, got {type(yaml_content)}."
-                    )
-        else:
-            logger.info(
-                f"Presets file not found: {presets_file}. No presets will be loaded for initial data."
-            )
+        loaded_presets = _load_ui_preset_file("presets.yaml")
+        loaded_emotion_presets = _load_ui_preset_file("emotion_presets.yaml")
 
         initial_gen_result_placeholder = {
             "outputUrl": None,
@@ -560,6 +571,7 @@ async def get_ui_initial_data():
             "reference_files": reference_files,
             "predefined_voices": predefined_voices,
             "presets": loaded_presets,
+            "emotion_presets": loaded_emotion_presets,
             "initial_gen_result": initial_gen_result_placeholder,
             "model_info": model_info,  # NEW: Include model information
         }
