@@ -25,6 +25,14 @@
 # Treat the numbers as starting points. Voices differ, and the reference clip has
 # as much say in the result as these sliders do.
 
+# The model's own baseline. Doubles as the reset for this row.
+- name: "😐 Neutral"
+  params:
+    temperature: 0.75
+    exaggeration: 0.5
+    cfg_weight: 0.5
+    speed_factor: 1.0
+
 - name: "😊 Happy"
   params:
     temperature: 0.9
@@ -66,3 +74,32 @@
     exaggeration: 0.35
     cfg_weight: 0.4
     speed_factor: 0.9
+
+- name: "🤩 Excited"
+  params:
+    temperature: 0.95
+    exaggeration: 1.25
+    cfg_weight: 0.45
+    speed_factor: 1.15
+
+- name: "😨 Fearful"
+  params:
+    temperature: 1.0
+    exaggeration: 1.0
+    cfg_weight: 0.5
+    speed_factor: 1.1
+
+- name: "😬 Suspenseful"
+  params:
+    temperature: 0.85
+    exaggeration: 0.95
+    cfg_weight: 0.25
+    speed_factor: 0.9
+
+# A delivery register rather than a feeling: steady, tightly-tracked announcer read.
+- name: "🎙️ Authoritative"
+  params:
+    temperature: 0.7
+    exaggeration: 0.75
+    cfg_weight: 0.65
+    speed_factor: 0.95
